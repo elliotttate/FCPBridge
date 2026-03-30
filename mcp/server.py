@@ -363,76 +363,123 @@ def import_fcpxml(xml: str, internal: bool = True) -> str:
 @mcp.tool()
 def generate_fcpxml(event_name: str = "FCPBridge Event", project_name: str = "FCPBridge Project",
                     frame_rate: str = "24", width: int = 1920, height: int = 1080,
-                    duration_seconds: float = 10.0,
-                    generators: str = "[]") -> str:
-    """Generate valid FCPXML for import. Creates a project with generators/gaps.
+                    items: str = "[]") -> str:
+    """Generate valid FCPXML for import. Creates a project with clips, gaps, titles,
+    transitions, and markers. Uses rational time (fractions) to avoid frame drift.
 
-    generators: JSON array of items to add. Each item:
+    items: JSON array of timeline items. Each item:
       {"type": "gap", "duration": 5.0}
+      {"type": "gap", "duration": 5.0, "name": "My Gap"}
       {"type": "title", "text": "Hello World", "duration": 5.0}
+      {"type": "title", "text": "Lower Third", "duration": 3.0, "position": "lower-third"}
+      {"type": "marker", "time": 2.5, "name": "Review Here", "kind": "standard"}
+      {"type": "marker", "time": 5.0, "name": "Chapter 1", "kind": "chapter"}
+      {"type": "transition", "duration": 1.0}
 
-    Returns the FCPXML string ready for import_fcpxml().
+    Returns the FCPXML string. Pass to import_fcpxml() to load into FCP.
 
-    Example: generate_fcpxml(project_name="My Project", duration_seconds=30,
-             generators='[{"type":"gap","duration":10},{"type":"gap","duration":10}]')
+    Example:
+      xml = generate_fcpxml(project_name="Test", items='[
+        {"type":"gap","duration":5},
+        {"type":"transition","duration":1},
+        {"type":"title","text":"Hello","duration":3},
+        {"type":"gap","duration":5},
+        {"type":"marker","time":2,"name":"Start","kind":"chapter"}
+      ]')
+      import_fcpxml(xml, internal=True)
     """
-    import json as j
     try:
-        items = j.loads(generators)
-    except j.JSONDecodeError:
-        items = []
+        item_list = json.loads(items)
+    except json.JSONDecodeError:
+        item_list = []
 
-    # Frame rate mapping
-    fr_map = {"23.976": ("24000/1001s", "24000", "1001"),
-              "24": ("1/24s", "24", "1"), "25": ("1/25s", "25", "1"),
-              "29.97": ("30000/1001s", "30000", "1001"),
-              "30": ("1/30s", "30", "1"), "50": ("1/50s", "50", "1"),
-              "59.94": ("60000/1001s", "60000", "1001"),
-              "60": ("1/60s", "60", "1")}
-    fd, num, den = fr_map.get(frame_rate, ("1/24s", "24", "1"))
+    # Rational frame rate mapping (numerator/denominator for exact frame boundaries)
+    fr_map = {
+        "23.976": (1001, 24000), "24": (100, 2400), "25": (100, 2500),
+        "29.97": (1001, 30000), "30": (100, 3000), "48": (100, 4800),
+        "50": (100, 5000), "59.94": (1001, 60000), "60": (100, 6000),
+    }
+    fd_num, fd_den = fr_map.get(frame_rate, (100, 2400))
+    fd_str = f"{fd_num}/{fd_den}s"
 
-    total_frames = int(float(duration_seconds) * int(num) / int(den))
+    def dur_rational(seconds):
+        """Convert seconds to rational time string using the timebase."""
+        frames = round(seconds * fd_den / fd_num)
+        return f"{frames * fd_num}/{fd_den}s"
 
-    # Build spine items
+    # Separate spine items from markers
+    spine_items = [i for i in item_list if i.get("type") in ("gap", "title", "transition", None)]
+    markers = [i for i in item_list if i.get("type") == "marker"]
+
+    if not spine_items:
+        spine_items = [{"type": "gap", "duration": 10.0}]
+
+    # Build spine XML - respecting DTD child ordering
     spine_xml = ""
-    if not items:
-        spine_xml = f'<gap name="Gap" offset="0s" duration="{total_frames}/{num}s" start="3600s"/>'
-    else:
-        offset_frames = 0
-        for item in items:
-            item_type = item.get("type", "gap")
-            item_dur = item.get("duration", 5.0)
-            item_frames = int(item_dur * int(num) / int(den))
-            dur_str = f"{item_frames}/{num}s"
-            off_str = f"{offset_frames}/{num}s"
+    offset_seconds = 0.0
+    total_seconds = 0.0
+    ts_counter = 1
 
-            if item_type == "gap":
-                spine_xml += f'<gap name="Gap" offset="{off_str}" duration="{dur_str}" start="3600s"/>\n'
-            elif item_type == "title":
-                text = item.get("text", "Title")
-                spine_xml += f'''<title name="{text}" offset="{off_str}" duration="{dur_str}" start="3600s">
-  <text><text-style ref="ts1">{text}</text-style></text>
-  <text-style-def id="ts1"><text-style font="Helvetica" fontSize="63" fontColor="1 1 1 1"/></text-style-def>
-</title>\n'''
-            offset_frames += item_frames
+    for item in spine_items:
+        itype = item.get("type", "gap")
+        idur = item.get("duration", 5.0)
+        iname = item.get("name", "")
+        dur_str = dur_rational(idur)
+        off_str = dur_rational(offset_seconds)
+
+        if itype == "gap":
+            gap_name = iname or "Gap"
+            spine_xml += f'            <gap name="{gap_name}" offset="{off_str}" duration="{dur_str}" start="3600s"/>\n'
+        elif itype == "title":
+            text = item.get("text", "Title")
+            title_name = iname or text
+            font_size = "63" if item.get("position") != "lower-third" else "42"
+            ts_id = f"ts{ts_counter}"
+            ts_counter += 1
+            # DTD order: note, adjust-*, audio, video, clip, title, caption, marker, keyword, filter-*
+            spine_xml += f'''            <title name="{title_name}" offset="{off_str}" duration="{dur_str}" start="3600s">
+                <text><text-style ref="{ts_id}">{text}</text-style></text>
+                <text-style-def id="{ts_id}"><text-style font="Helvetica" fontSize="{font_size}" fontColor="1 1 1 1"/></text-style-def>
+            </title>\n'''
+        elif itype == "transition":
+            spine_xml += f'            <transition name="Cross Dissolve" offset="{off_str}" duration="{dur_str}"/>\n'
+
+        offset_seconds += idur
+        total_seconds += idur
+
+    total_dur_str = dur_rational(total_seconds)
+
+    # Build markers XML (attached to the sequence)
+    markers_xml = ""
+    for m in markers:
+        mt = m.get("time", 0)
+        mname = m.get("name", "Marker")
+        mkind = m.get("kind", "standard")
+        moff = dur_rational(mt)
+        mdur = dur_rational(m.get("duration", 0) if m.get("duration") else fd_num / fd_den)
+        if mkind == "chapter":
+            markers_xml += f'            <chapter-marker start="{moff}" duration="{mdur}" value="{mname}" posterOffset="0s"/>\n'
+        elif mkind == "todo":
+            markers_xml += f'            <marker start="{moff}" duration="{mdur}" value="{mname}" completed="0"/>\n'
+        else:
+            markers_xml += f'            <marker start="{moff}" duration="{mdur}" value="{mname}"/>\n'
 
     xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
 <fcpxml version="1.11">
-  <resources>
-    <format id="r1" name="FFVideoFormat{width}x{height}p{frame_rate}" frameDuration="{fd}" width="{width}" height="{height}"/>
-  </resources>
-  <library>
-    <event name="{event_name}">
-      <project name="{project_name}">
-        <sequence format="r1" duration="{total_frames}/{num}s" tcStart="0s" tcFormat="NDF">
-          <spine>
-            {spine_xml}
-          </spine>
-        </sequence>
-      </project>
-    </event>
-  </library>
+    <resources>
+        <format id="r1" name="FFVideoFormat{width}x{height}p{frame_rate}" frameDuration="{fd_str}" width="{width}" height="{height}"/>
+    </resources>
+    <library>
+        <event name="{event_name}">
+            <project name="{project_name}">
+                <sequence format="r1" duration="{total_dur_str}" tcStart="0s" tcFormat="NDF">
+                    <spine>
+{spine_xml}                    </spine>
+{markers_xml}                </sequence>
+            </project>
+        </event>
+    </library>
 </fcpxml>'''
 
     return xml
@@ -464,6 +511,199 @@ def get_clip_effects(handle: str = "") -> str:
         lines.append(f"\nEffect stack handle: {r['effectStackHandle']}")
 
     return "\n".join(lines)
+
+
+# ============================================================
+# Batch Operations
+# ============================================================
+
+@mcp.tool()
+def batch_timeline_actions(actions: str) -> str:
+    """Execute multiple timeline/playback actions in sequence.
+    Much more efficient than calling individual tools.
+
+    actions: JSON array of action objects. Each action:
+      {"type": "timeline", "action": "blade"}
+      {"type": "playback", "action": "nextFrame"}
+      {"type": "playback", "action": "nextFrame", "repeat": 30}
+      {"type": "wait", "seconds": 0.5}
+
+    Example: blade at 3 positions:
+      batch_timeline_actions('[
+        {"type":"playback","action":"goToStart"},
+        {"type":"playback","action":"nextFrame","repeat":48},
+        {"type":"timeline","action":"blade"},
+        {"type":"playback","action":"nextFrame","repeat":48},
+        {"type":"timeline","action":"blade"},
+        {"type":"playback","action":"nextFrame","repeat":48},
+        {"type":"timeline","action":"blade"}
+      ]')
+    """
+    try:
+        action_list = json.loads(actions)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+
+    results = []
+    for i, act in enumerate(action_list):
+        act_type = act.get("type", "timeline")
+        action_name = act.get("action", "")
+        repeat = act.get("repeat", 1)
+
+        if act_type == "wait":
+            secs = act.get("seconds", 0.5)
+            time.sleep(secs)
+            results.append(f"[{i}] wait {secs}s")
+        elif act_type == "playback":
+            for _ in range(repeat):
+                r = bridge.call("playback.action", action=action_name)
+            results.append(f"[{i}] playback.{action_name}" + (f" x{repeat}" if repeat > 1 else ""))
+        elif act_type == "timeline":
+            for _ in range(repeat):
+                r = bridge.call("timeline.action", action=action_name)
+            results.append(f"[{i}] timeline.{action_name}" + (f" x{repeat}" if repeat > 1 else ""))
+        else:
+            results.append(f"[{i}] unknown type: {act_type}")
+
+    return f"Executed {len(action_list)} actions:\n" + "\n".join(results)
+
+
+# ============================================================
+# Timeline Analysis
+# ============================================================
+
+@mcp.tool()
+def analyze_timeline() -> str:
+    """Analyze the current timeline: duration, clip count, pacing stats,
+    potential issues (short clips, gaps). Returns a structured report.
+    """
+    r = bridge.call("timeline.getDetailedState")
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+
+    items = r.get("items", [])
+    total_dur = r.get("duration", {}).get("seconds", 0)
+    playhead = r.get("playheadTime", {}).get("seconds", 0)
+
+    # Analyze clips
+    clips = [i for i in items if "Transition" not in i.get("class", "")]
+    transitions = [i for i in items if "Transition" in i.get("class", "")]
+    durations = [i.get("duration", {}).get("seconds", 0) for i in clips]
+
+    short_clips = [i for i in clips if i.get("duration", {}).get("seconds", 0) < 0.5]
+    long_clips = [i for i in clips if i.get("duration", {}).get("seconds", 0) > 30]
+
+    avg_dur = sum(durations) / len(durations) if durations else 0
+    min_dur = min(durations) if durations else 0
+    max_dur = max(durations) if durations else 0
+
+    # Pacing analysis (quartiles)
+    pacing = ""
+    if len(durations) >= 4:
+        q = len(durations) // 4
+        q1_avg = sum(durations[:q]) / q if q else 0
+        q4_avg = sum(durations[-q:]) / q if q else 0
+        if q4_avg < q1_avg * 0.7:
+            pacing = "Accelerating (cuts getting faster)"
+        elif q4_avg > q1_avg * 1.3:
+            pacing = "Decelerating (cuts getting slower)"
+        else:
+            pacing = "Steady"
+
+    lines = [
+        f"=== Timeline Analysis ===",
+        f"Sequence: {r.get('sequenceName', '?')}",
+        f"Duration: {total_dur:.1f}s ({total_dur/60:.1f}min)",
+        f"Playhead: {playhead:.1f}s",
+        f"",
+        f"Clips: {len(clips)}",
+        f"Transitions: {len(transitions)}",
+        f"Avg clip duration: {avg_dur:.2f}s",
+        f"Shortest clip: {min_dur:.2f}s",
+        f"Longest clip: {max_dur:.2f}s",
+    ]
+
+    if pacing:
+        lines.append(f"Pacing: {pacing}")
+
+    # Issues
+    issues = []
+    if short_clips:
+        issues.append(f"Flash frames: {len(short_clips)} clips < 0.5s")
+    if long_clips:
+        issues.append(f"Long clips: {len(long_clips)} clips > 30s")
+
+    if issues:
+        lines.append(f"\nPotential issues:")
+        for issue in issues:
+            lines.append(f"  - {issue}")
+    else:
+        lines.append(f"\nNo issues detected")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# SRT/Transcript to Markers
+# ============================================================
+
+@mcp.tool()
+def import_srt_as_markers(srt_content: str) -> str:
+    """Import SRT subtitle content as markers in the current timeline.
+    Each subtitle becomes a standard marker at the corresponding timecode.
+
+    srt_content: SRT file content as string. Example:
+      1
+      00:00:05,000 --> 00:00:10,000
+      Hello world
+
+      2
+      00:01:30,500 --> 00:01:35,000
+      Second subtitle
+    """
+    import re
+
+    # Parse SRT
+    blocks = re.split(r'\n\n+', srt_content.strip())
+    markers_added = 0
+    errors = []
+
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 3:
+            continue
+
+        # Parse timestamp line: 00:00:05,000 --> 00:00:10,000
+        ts_match = re.match(r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})', lines[1])
+        if not ts_match:
+            continue
+
+        h, m, s, ms = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)), int(ts_match.group(4))
+        total_seconds = h * 3600 + m * 60 + s + ms / 1000.0
+
+        text = ' '.join(lines[2:]).strip()
+
+        # Navigate to the timestamp and add marker
+        # Use frame stepping to get close (at 24fps)
+        frames = int(total_seconds * 24)
+
+        # Go to start, step to position, add marker
+        bridge.call("playback.action", action="goToStart")
+        for _ in range(frames):
+            bridge.call("playback.action", action="nextFrame")
+
+        r = bridge.call("timeline.action", action="addMarker")
+        if not _err(r):
+            markers_added += 1
+        else:
+            errors.append(f"Failed at {total_seconds:.1f}s: {r}")
+
+    result = f"Imported {markers_added} markers from SRT"
+    if errors:
+        result += f"\nErrors: {len(errors)}"
+        for e in errors[:5]:
+            result += f"\n  - {e}"
+    return result
 
 
 # ============================================================
