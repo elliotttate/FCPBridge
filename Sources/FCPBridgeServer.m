@@ -708,9 +708,21 @@ static NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *para
                 }
             }
 
-            // Contained items
-            if ([sequence respondsToSelector:@selector(containedItems)]) {
-                id items = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(containedItems));
+            // Contained items - FCP uses spine model: sequence -> primaryObject (collection) -> items
+            id itemsSource = nil;
+            if ([sequence respondsToSelector:@selector(primaryObject)]) {
+                id primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+                if (primaryObj && [primaryObj respondsToSelector:@selector(containedItems)]) {
+                    itemsSource = ((id (*)(id, SEL))objc_msgSend)(primaryObj, @selector(containedItems));
+                }
+            }
+            // Fallback to sequence.containedItems
+            if (!itemsSource && [sequence respondsToSelector:@selector(containedItems)]) {
+                itemsSource = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(containedItems));
+            }
+
+            if (itemsSource) {
+                id items = itemsSource;
                 if ([items isKindOfClass:[NSArray class]]) {
                     NSArray *arr = (NSArray *)items;
                     state[@"itemCount"] = @(arr.count);
@@ -942,6 +954,64 @@ static NSDictionary *FCPBridge_handleTimelineAction(NSDictionary *params) {
         @"insertPlaceholder": @"insertPlaceholderStoryline:",
         @"insertGap":        @"insertGapAtPlayhead:",
     };
+
+    // Undo/redo go through the document's FFUndoManager
+    if ([action isEqualToString:@"undo"] || [action isEqualToString:@"redo"]) {
+        __block NSDictionary *undoResult = nil;
+        FCPBridge_executeOnMainThread(^{
+            @try {
+                id app = ((id (*)(id, SEL))objc_msgSend)(
+                    objc_getClass("NSApplication"), @selector(sharedApplication));
+                id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+                // PEAppController -> _targetLibrary -> libraryDocument -> undoManager
+                SEL libSel = NSSelectorFromString(@"_targetLibrary");
+                id library = nil;
+                if ([delegate respondsToSelector:libSel]) {
+                    library = ((id (*)(id, SEL))objc_msgSend)(delegate, libSel);
+                }
+                if (!library) {
+                    // Fallback: get first active library
+                    id libs = ((id (*)(id, SEL))objc_msgSend)(
+                        objc_getClass("FFLibraryDocument"), @selector(copyActiveLibraries));
+                    if ([libs respondsToSelector:@selector(firstObject)]) {
+                        library = ((id (*)(id, SEL))objc_msgSend)(libs, @selector(firstObject));
+                    }
+                }
+                if (!library) {
+                    undoResult = @{@"error": @"No library found for undo"};
+                    return;
+                }
+                id doc = ((id (*)(id, SEL))objc_msgSend)(library, @selector(libraryDocument));
+                if (!doc) {
+                    undoResult = @{@"error": @"No document found for undo"};
+                    return;
+                }
+                id um = ((id (*)(id, SEL))objc_msgSend)(doc, @selector(undoManager));
+                if (!um) {
+                    undoResult = @{@"error": @"No undo manager"};
+                    return;
+                }
+
+                SEL undoSel = [action isEqualToString:@"undo"] ? @selector(undo) : @selector(redo);
+                SEL canSel = [action isEqualToString:@"undo"] ? @selector(canUndo) : @selector(canRedo);
+                SEL nameSel = [action isEqualToString:@"undo"] ? @selector(undoActionName) : @selector(redoActionName);
+
+                BOOL can = ((BOOL (*)(id, SEL))objc_msgSend)(um, canSel);
+                if (!can) {
+                    undoResult = @{@"error": [NSString stringWithFormat:@"Cannot %@ - nothing to %@", action, action]};
+                    return;
+                }
+
+                NSString *actionName = ((id (*)(id, SEL))objc_msgSend)(um, nameSel);
+                ((void (*)(id, SEL))objc_msgSend)(um, undoSel);
+                undoResult = @{@"action": action, @"status": @"ok",
+                              @"actionName": actionName ?: @""};
+            } @catch (NSException *e) {
+                undoResult = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+            }
+        });
+        return undoResult;
+    }
 
     NSString *selector = actionMap[action];
     if (!selector) {
