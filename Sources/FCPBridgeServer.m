@@ -776,30 +776,190 @@ static NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *para
 static NSDictionary *FCPBridge_handleFCPXMLImport(NSDictionary *params) {
     NSString *xml = params[@"xml"];
     if (!xml) return @{@"error": @"xml parameter required"};
+    BOOL useInternal = [params[@"internal"] boolValue];
 
     __block NSDictionary *result = nil;
     FCPBridge_executeOnMainThread(^{
         @try {
-            NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"fcpbridge_import.fcpxml"];
-            NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
-            [data writeToFile:tmpPath atomically:YES];
+            if (useInternal) {
+                // Internal import via PEAppController.openXMLDocumentWithURL:
+                NSString *tmpPath = [NSTemporaryDirectory()
+                    stringByAppendingPathComponent:@"fcpbridge_import.fcpxml"];
+                NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
+                [data writeToFile:tmpPath atomically:YES];
+                NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
 
-            NSURL *fileURL = [NSURL fileURLWithPath:tmpPath];
-            NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
-            __block BOOL opened = NO;
-            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-            [[NSWorkspace sharedWorkspace] openURLs:@[fileURL]
-                withApplicationAtURL:[NSURL fileURLWithPath:
-                    @"/Applications/Final Cut Pro.app"]
-                configuration:config
-                completionHandler:^(NSRunningApplication *app, NSError *error) {
-                    opened = (error == nil);
-                    dispatch_semaphore_signal(sem);
-                }];
-            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-            result = @{@"status": opened ? @"ok" : @"failed",
-                       @"path": tmpPath,
-                       @"message": opened ? @"FCPXML import triggered" : @"Failed to open FCPXML file"};
+                id app = ((id (*)(id, SEL))objc_msgSend)(
+                    objc_getClass("NSApplication"), @selector(sharedApplication));
+                id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+
+                SEL openSel = NSSelectorFromString(@"openXMLDocumentWithURL:bundleURL:display:sender:");
+                if ([delegate respondsToSelector:openSel]) {
+                    ((void (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
+                        delegate, openSel, tmpURL, nil, YES, nil);
+                    result = @{@"status": @"ok", @"method": @"internal",
+                               @"message": @"FCPXML import triggered via PEAppController"};
+                } else {
+                    result = @{@"error": @"PEAppController does not respond to openXMLDocumentWithURL:"};
+                }
+            } else {
+                // File-based import via NSWorkspace
+                NSString *tmpPath = [NSTemporaryDirectory()
+                    stringByAppendingPathComponent:@"fcpbridge_import.fcpxml"];
+                NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
+                [data writeToFile:tmpPath atomically:YES];
+
+                NSURL *fileURL = [NSURL fileURLWithPath:tmpPath];
+                NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+                __block BOOL opened = NO;
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [[NSWorkspace sharedWorkspace] openURLs:@[fileURL]
+                    withApplicationAtURL:[NSURL fileURLWithPath:
+                        @"/Applications/Final Cut Pro.app"]
+                    configuration:config
+                    completionHandler:^(NSRunningApplication *app, NSError *error) {
+                        opened = (error == nil);
+                        dispatch_semaphore_signal(sem);
+                    }];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+                result = @{@"status": opened ? @"ok" : @"failed",
+                           @"method": @"file",
+                           @"message": opened ? @"FCPXML import triggered" : @"Failed to open file"};
+            }
+        } @catch (NSException *e) {
+            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+        }
+    });
+    return result;
+}
+
+#pragma mark - Effect Discovery
+
+static NSDictionary *FCPBridge_handleEffectList(NSDictionary *params) {
+    NSString *filter = params[@"filter"];
+
+    __block NSDictionary *result = nil;
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = FCPBridge_getActiveTimelineModule();
+            if (!timeline) {
+                result = @{@"error": @"No active timeline"};
+                return;
+            }
+
+            // Get the sequence's effect registry via the sequence
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+            if (!sequence) {
+                result = @{@"error": @"No sequence"};
+                return;
+            }
+
+            // Try to get effects from the FFEffectRegistry
+            Class registryClass = objc_getClass("FFEffectRegistry");
+            if (!registryClass) {
+                result = @{@"error": @"FFEffectRegistry class not found"};
+                return;
+            }
+
+            // Get the shared registry
+            SEL regSel = NSSelectorFromString(@"registry:");
+            id registry = nil;
+            if ([registryClass respondsToSelector:regSel]) {
+                registry = ((id (*)(id, SEL, id))objc_msgSend)((id)registryClass, regSel, nil);
+            }
+            if (!registry) {
+                // Try alternate: sharedRegistry
+                SEL sharedSel = NSSelectorFromString(@"sharedRegistry");
+                if ([registryClass respondsToSelector:sharedSel]) {
+                    registry = ((id (*)(id, SEL))objc_msgSend)((id)registryClass, sharedSel);
+                }
+            }
+
+            if (registry) {
+                NSString *h = FCPBridge_storeHandle(registry);
+                result = @{@"handle": h, @"class": NSStringFromClass([registry class]),
+                           @"message": @"Use get_object_property to explore the registry"};
+            } else {
+                result = @{@"error": @"Could not get FFEffectRegistry instance"};
+            }
+        } @catch (NSException *e) {
+            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+        }
+    });
+    return result;
+}
+
+static NSDictionary *FCPBridge_handleGetClipEffects(NSDictionary *params) {
+    NSString *clipHandle = params[@"handle"];
+
+    __block NSDictionary *result = nil;
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id clip = nil;
+            if (clipHandle) {
+                clip = FCPBridge_resolveHandle(clipHandle);
+            }
+
+            if (!clip) {
+                // Get first selected clip
+                id timeline = FCPBridge_getActiveTimelineModule();
+                if (!timeline) { result = @{@"error": @"No timeline"}; return; }
+
+                SEL selSel = NSSelectorFromString(@"selectedItems:includeItemBeforePlayheadIfLast:");
+                if ([timeline respondsToSelector:selSel]) {
+                    id selected = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(timeline, selSel, NO, NO);
+                    if ([selected respondsToSelector:@selector(firstObject)]) {
+                        clip = ((id (*)(id, SEL))objc_msgSend)(selected, @selector(firstObject));
+                    }
+                }
+            }
+
+            if (!clip) { result = @{@"error": @"No clip found (provide handle or select a clip)"}; return; }
+
+            NSMutableDictionary *info = [NSMutableDictionary dictionary];
+            info[@"clipClass"] = NSStringFromClass([clip class]);
+            if ([clip respondsToSelector:@selector(displayName)]) {
+                info[@"clipName"] = ((id (*)(id, SEL))objc_msgSend)(clip, @selector(displayName)) ?: @"";
+            }
+
+            // Get effect stack
+            SEL esSel = @selector(effectStack);
+            if ([clip respondsToSelector:esSel]) {
+                id effectStack = ((id (*)(id, SEL))objc_msgSend)(clip, esSel);
+                if (effectStack) {
+                    NSString *esHandle = FCPBridge_storeHandle(effectStack);
+                    info[@"effectStackHandle"] = esHandle;
+                    info[@"effectStackClass"] = NSStringFromClass([effectStack class]);
+                    info[@"effectStackDescription"] = [[effectStack description] substringToIndex:
+                        MIN((NSUInteger)500, [[effectStack description] length])];
+                }
+            }
+
+            // Try to get effects array
+            SEL efSel = NSSelectorFromString(@"effects");
+            if ([clip respondsToSelector:efSel]) {
+                id effects = ((id (*)(id, SEL))objc_msgSend)(clip, efSel);
+                if ([effects isKindOfClass:[NSArray class]]) {
+                    NSMutableArray *efList = [NSMutableArray array];
+                    for (id effect in (NSArray *)effects) {
+                        NSMutableDictionary *ef = [NSMutableDictionary dictionary];
+                        ef[@"class"] = NSStringFromClass([effect class]);
+                        if ([effect respondsToSelector:@selector(displayName)]) {
+                            ef[@"name"] = ((id (*)(id, SEL))objc_msgSend)(effect, @selector(displayName)) ?: @"";
+                        }
+                        if ([effect respondsToSelector:@selector(effectID)]) {
+                            ef[@"effectID"] = ((id (*)(id, SEL))objc_msgSend)(effect, @selector(effectID)) ?: @"";
+                        }
+                        NSString *efHandle = FCPBridge_storeHandle(effect);
+                        ef[@"handle"] = efHandle;
+                        [efList addObject:ef];
+                    }
+                    info[@"effects"] = efList;
+                    info[@"effectCount"] = @([(NSArray *)effects count]);
+                }
+            }
+
+            result = info;
         } @catch (NSException *e) {
             result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
         }
@@ -913,7 +1073,7 @@ static NSDictionary *FCPBridge_handleTimelineAction(NSDictionary *params) {
     NSString *action = params[@"action"];
     if (!action) return @{@"error": @"action parameter required"};
 
-    // Map friendly names to selectors
+    // Map friendly names to selectors on FFAnchoredTimelineModule
     NSDictionary *actionMap = @{
         // Blade/Split
         @"blade":            @"blade:",
@@ -950,9 +1110,62 @@ static NSDictionary *FCPBridge_handleTimelineAction(NSDictionary *params) {
         @"trimToPlayhead":   @"trimToPlayhead:",
         @"extendEditToPlayhead": @"actionExtendEditToPlayhead",
 
-        // Other
+        // Insert
         @"insertPlaceholder": @"insertPlaceholderStoryline:",
         @"insertGap":        @"insertGapAtPlayhead:",
+
+        // Color Correction (add to selected clips)
+        @"addColorBoard":          @"addColorBoardEffect:",
+        @"addColorWheels":         @"addColorWheelsEffect:",
+        @"addColorCurves":         @"addColorCurvesEffect:",
+        @"addColorAdjustment":     @"addColorAdjustmentEffect:",
+        @"addHueSaturation":       @"addHueSaturationEffect:",
+        @"addEnhanceLightAndColor":@"addEnhanceLightAndColorEffect:",
+
+        // Volume
+        @"adjustVolumeUp":         @"adjustVolumeRelative:",
+        @"adjustVolumeDown":       @"adjustVolumeAbsolute:",
+
+        // Titles
+        @"addBasicTitle":          @"addBasicTitle:",
+        @"addBasicLowerThird":     @"addBasicLowerThird:",
+
+        // Retiming/Speed presets
+        @"retimeNormal":     @"retimeNormal:",
+        @"retimeFast2x":     @"retimeFastx2:",
+        @"retimeFast4x":     @"retimeFastx4:",
+        @"retimeFast8x":     @"retimeFastx8:",
+        @"retimeFast20x":    @"retimeFastx20:",
+        @"retimeSlow50":     @"retimeSlowHalf:",
+        @"retimeSlow25":     @"retimeSlowQuarter:",
+        @"retimeSlow10":     @"retimeSlowTenth:",
+        @"retimeReverse":    @"retimeReverse:",
+        @"retimeHold":       @"retimeHoldFromSelection:",
+        @"freezeFrame":      @"freezeFrame:",
+        @"retimeBladeSpeed": @"retimeBladeSpeed:",
+
+        // Generators
+        @"addVideoGenerator": @"addVideoGenerator:",
+
+        // Export/Share
+        @"exportXML":        @"exportXML:",
+        @"shareSelection":   @"shareSelection:",
+
+        // Keyframes
+        @"addKeyframe":      @"addKeyframe:",
+        @"deleteKeyframes":  @"deleteKeyframes:",
+        @"nextKeyframe":     @"nextKeyframe:",
+        @"previousKeyframe": @"previousKeyframe:",
+
+        // Solo/Disable
+        @"solo":             @"soloSelectedClips:",
+        @"disable":          @"disableSelectedClips:",
+
+        // Compound clips
+        @"createCompoundClip": @"createCompoundClip:",
+
+        // Auto-reframe
+        @"autoReframe":      @"autoReframe:",
     };
 
     // Undo/redo go through the document's FFUndoManager
@@ -1289,6 +1502,12 @@ static NSDictionary *FCPBridge_handleRequest(NSDictionary *request) {
     // fcpxml.* namespace
     else if ([method isEqualToString:@"fcpxml.import"]) {
         result = FCPBridge_handleFCPXMLImport(params);
+    }
+    // effects.* namespace
+    else if ([method isEqualToString:@"effects.list"]) {
+        result = FCPBridge_handleEffectList(params);
+    } else if ([method isEqualToString:@"effects.getClipEffects"]) {
+        result = FCPBridge_handleGetClipEffects(params);
     }
     else {
         return @{@"error": @{@"code": @(-32601), @"message":

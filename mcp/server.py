@@ -124,12 +124,26 @@ def timeline_action(action: str) -> str:
     """Perform a timeline editing action via direct ObjC calls.
 
     Actions:
-      blade, bladeAll, addMarker, addTodoMarker, addChapterMarker, deleteMarker,
-      nextMarker, previousMarker, addTransition, nextEdit, previousEdit,
-      selectClipAtPlayhead, selectToPlayhead, selectAll, deselectAll,
-      delete, cut, copy, paste, undo, redo, insertGap, trimToPlayhead
+      Blade: blade, bladeAll
+      Markers: addMarker, addTodoMarker, addChapterMarker, deleteMarker, nextMarker, previousMarker
+      Transitions: addTransition
+      Navigation: nextEdit, previousEdit, selectClipAtPlayhead, selectToPlayhead
+      Selection: selectAll, deselectAll
+      Edit: delete, cut, copy, paste, undo, redo
+      Insert: insertGap
+      Trim: trimToPlayhead
+      Color: addColorBoard, addColorWheels, addColorCurves, addColorAdjustment,
+             addHueSaturation, addEnhanceLightAndColor
+      Volume: adjustVolumeUp, adjustVolumeDown
+      Titles: addBasicTitle, addBasicLowerThird
+      Speed: retimeNormal, retimeFast2x, retimeFast4x, retimeFast8x, retimeFast20x,
+             retimeSlow50, retimeSlow25, retimeSlow10, retimeReverse, retimeHold,
+             freezeFrame, retimeBladeSpeed
+      Keyframes: addKeyframe, deleteKeyframes, nextKeyframe, previousKeyframe
+      Other: solo, disable, createCompoundClip, autoReframe, exportXML,
+             shareSelection, addVideoGenerator
 
-    You can also pass any raw ObjC selector name (e.g. "freezeFrame").
+    You can also pass any raw ObjC selector name.
     """
     r = bridge.call("timeline.action", action=action)
     if _err(r):
@@ -335,14 +349,121 @@ def set_object_property(handle: str, key: str, value: str, value_type: str = "st
 # ============================================================
 
 @mcp.tool()
-def import_fcpxml(xml: str) -> str:
-    """Import FCPXML into FCP. Writes to a temp file and opens it with FCP's native importer.
-    Provide valid FCPXML as a string. This can create entire timelines, add clips, etc.
+def import_fcpxml(xml: str, internal: bool = True) -> str:
+    """Import FCPXML into FCP. If internal=True, uses PEAppController's import method
+    (imports into the running instance without restart). If internal=False, opens via NSWorkspace.
+    Provide valid FCPXML as a string.
     """
-    r = bridge.call("fcpxml.import", xml=xml)
+    r = bridge.call("fcpxml.import", xml=xml, internal=internal)
     if _err(r):
         return f"Error: {r.get('error', r)}"
     return _fmt(r)
+
+
+@mcp.tool()
+def generate_fcpxml(event_name: str = "FCPBridge Event", project_name: str = "FCPBridge Project",
+                    frame_rate: str = "24", width: int = 1920, height: int = 1080,
+                    duration_seconds: float = 10.0,
+                    generators: str = "[]") -> str:
+    """Generate valid FCPXML for import. Creates a project with generators/gaps.
+
+    generators: JSON array of items to add. Each item:
+      {"type": "gap", "duration": 5.0}
+      {"type": "title", "text": "Hello World", "duration": 5.0}
+
+    Returns the FCPXML string ready for import_fcpxml().
+
+    Example: generate_fcpxml(project_name="My Project", duration_seconds=30,
+             generators='[{"type":"gap","duration":10},{"type":"gap","duration":10}]')
+    """
+    import json as j
+    try:
+        items = j.loads(generators)
+    except j.JSONDecodeError:
+        items = []
+
+    # Frame rate mapping
+    fr_map = {"23.976": ("24000/1001s", "24000", "1001"),
+              "24": ("1/24s", "24", "1"), "25": ("1/25s", "25", "1"),
+              "29.97": ("30000/1001s", "30000", "1001"),
+              "30": ("1/30s", "30", "1"), "50": ("1/50s", "50", "1"),
+              "59.94": ("60000/1001s", "60000", "1001"),
+              "60": ("1/60s", "60", "1")}
+    fd, num, den = fr_map.get(frame_rate, ("1/24s", "24", "1"))
+
+    total_frames = int(float(duration_seconds) * int(num) / int(den))
+
+    # Build spine items
+    spine_xml = ""
+    if not items:
+        spine_xml = f'<gap name="Gap" offset="0s" duration="{total_frames}/{num}s" start="3600s"/>'
+    else:
+        offset_frames = 0
+        for item in items:
+            item_type = item.get("type", "gap")
+            item_dur = item.get("duration", 5.0)
+            item_frames = int(item_dur * int(num) / int(den))
+            dur_str = f"{item_frames}/{num}s"
+            off_str = f"{offset_frames}/{num}s"
+
+            if item_type == "gap":
+                spine_xml += f'<gap name="Gap" offset="{off_str}" duration="{dur_str}" start="3600s"/>\n'
+            elif item_type == "title":
+                text = item.get("text", "Title")
+                spine_xml += f'''<title name="{text}" offset="{off_str}" duration="{dur_str}" start="3600s">
+  <text><text-style ref="ts1">{text}</text-style></text>
+  <text-style-def id="ts1"><text-style font="Helvetica" fontSize="63" fontColor="1 1 1 1"/></text-style-def>
+</title>\n'''
+            offset_frames += item_frames
+
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" name="FFVideoFormat{width}x{height}p{frame_rate}" frameDuration="{fd}" width="{width}" height="{height}"/>
+  </resources>
+  <library>
+    <event name="{event_name}">
+      <project name="{project_name}">
+        <sequence format="r1" duration="{total_frames}/{num}s" tcStart="0s" tcFormat="NDF">
+          <spine>
+            {spine_xml}
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>'''
+
+    return xml
+
+
+# ============================================================
+# Effects & Color Correction
+# ============================================================
+
+@mcp.tool()
+def get_clip_effects(handle: str = "") -> str:
+    """Get the effects applied to a clip. If no handle provided, uses the first selected clip.
+    Returns effect names, IDs, classes, and handles for further inspection.
+    """
+    params = {}
+    if handle:
+        params["handle"] = handle
+    r = bridge.call("effects.getClipEffects", **params)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+
+    lines = [f"Clip: {r.get('clipName', '?')} ({r.get('clipClass', '?')})"]
+    effects = r.get("effects", [])
+    lines.append(f"Effects: {r.get('effectCount', len(effects))}")
+    for ef in effects:
+        lines.append(f"  {ef.get('name', '?')} ({ef.get('class', '?')}) ID={ef.get('effectID', '')} handle={ef.get('handle', '')}")
+
+    if r.get("effectStackHandle"):
+        lines.append(f"\nEffect stack handle: {r['effectStackHandle']}")
+
+    return "\n".join(lines)
 
 
 # ============================================================
