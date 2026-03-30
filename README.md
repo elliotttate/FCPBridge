@@ -40,7 +40,35 @@ FCPBridge injects a dynamic library into a re-signed copy of Final Cut Pro that:
         └─────────────────────────────┘
 ```
 
-## Setup
+## Quick Setup (Patcher)
+
+The easiest way to set up FCPBridge:
+
+```bash
+git clone https://github.com/elliotttate/FCPBridge.git
+cd FCPBridge
+./patcher/patch_fcp.sh
+```
+
+This automatically:
+1. Copies FCP to `~/Desktop/FinalCutPro_Modded/`
+2. Builds the FCPBridge dylib from source
+3. Injects it into the FCP binary
+4. Re-signs everything (no sandbox, library validation disabled)
+5. Patches CloudContent/ImagePlayground crash points
+6. Creates `.mcp.json` for Claude Code integration
+
+Then just launch the modded FCP and connect.
+
+### Patcher Options
+
+```bash
+./patcher/patch_fcp.sh --dest ~/my-fcp    # Custom destination
+./patcher/patch_fcp.sh --rebuild           # Rebuild dylib only (after code changes)
+./patcher/patch_fcp.sh --uninstall         # Remove the modded copy
+```
+
+## Manual Setup
 
 ### Prerequisites
 
@@ -181,19 +209,22 @@ Add to your `.mcp.json`:
 
 ```
 FCPBridge/
+├── patcher/
+│   └── patch_fcp.sh           # One-command patcher (copies, builds, injects, signs)
 ├── Sources/
-│   ├── FCPBridge.h              # Public header
-│   ├── FCPBridge.m              # Constructor, class caching, CloudContent fix
-│   ├── FCPBridgeRuntime.m       # ObjC runtime utilities
-│   ├── FCPBridgeServer.m        # JSON-RPC TCP server
-│   └── FCPBridgeSwizzle.m       # Method swizzling infrastructure
+│   ├── FCPBridge.h            # Public header
+│   ├── FCPBridge.m            # Constructor, class caching, CloudContent fix
+│   ├── FCPBridgeRuntime.m     # ObjC runtime utilities
+│   ├── FCPBridgeServer.m      # JSON-RPC TCP server (28 tool endpoints)
+│   └── FCPBridgeSwizzle.m     # Method swizzling infrastructure
 ├── Scripts/
-│   ├── fcpbridge_client.py      # Interactive Python REPL client
-│   └── launch.sh               # Launch helper script
+│   ├── fcpbridge_client.py    # Interactive Python REPL client
+│   └── launch.sh             # Launch helper script
 ├── mcp/
-│   └── server.py               # MCP server (14 tools)
-├── Makefile                    # Build, deploy, launch targets
-└── entitlements.plist          # Unsandboxed entitlements for re-signing
+│   └── server.py             # MCP server (28 tools)
+├── CLAUDE.md                  # Skill documentation for Claude
+├── Makefile                   # Build, deploy, launch targets
+└── entitlements.plist         # Unsandboxed entitlements for re-signing
 ```
 
 ## License
