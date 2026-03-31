@@ -126,16 +126,22 @@ class PatcherModel: ObservableObject {
         log = ""
         completedSteps = []
 
-        Task {
+        Task.detached { [self] in
             do {
-                try await runPatch()
-                isPatchComplete = true
-                status = .patched
+                try await self.runPatch()
+                await MainActor.run {
+                    self.isPatchComplete = true
+                    self.status = .patched
+                }
             } catch {
-                errorMessage = error.localizedDescription
-                appendLog("ERROR: \(error.localizedDescription)")
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                    self.appendLog("ERROR: \(error.localizedDescription)")
+                }
             }
-            isPatching = false
+            await MainActor.run {
+                self.isPatching = false
+            }
         }
     }
 
@@ -177,24 +183,30 @@ class PatcherModel: ObservableObject {
 
     // MARK: - Patch Steps
 
-    private func runPatch() async throws {
+    private nonisolated func runPatch() async throws {
         // Step 1: Prerequisites
-        await setStep(.checkPrereqs)
+        await setStepAsync(.checkPrereqs)
         if shell("xcode-select -p 2>/dev/null").isEmpty {
-            appendLog("Xcode Command Line Tools not found. Installing...")
+            await logAsync("Xcode Command Line Tools not found. Installing...")
             shell("xcode-select --install 2>/dev/null")
             throw PatchError.msg("Xcode Command Line Tools are required.\n\nAn installer window should have appeared. Please complete the installation, then click \"Patch Final Cut Pro\" again.")
         }
-        appendLog("Xcode tools: OK")
+        await logAsync("Xcode tools: OK")
+
+        let sourceApp = await MainActor.run { self.sourceApp }
+        let fcpVersion = await MainActor.run { self.fcpVersion }
+        let repoDir = await MainActor.run { self.repoDir }
+        let destDir = await MainActor.run { self.destDir }
+        let moddedApp = await MainActor.run { self.moddedApp }
 
         guard FileManager.default.fileExists(atPath: sourceApp) else {
             throw PatchError.msg("Final Cut Pro not found at \(sourceApp)")
         }
-        appendLog("FCP \(fcpVersion): OK")
+        await logAsync("FCP \(fcpVersion): OK")
 
         let repoSources = repoDir + "/Sources/FCPBridge.m"
         if !FileManager.default.fileExists(atPath: repoSources) {
-            appendLog("Downloading FCPBridge sources...")
+            await logAsync("Downloading FCPBridge sources...")
             let dlResult = shell("""
                 mkdir -p '\(repoDir)' && \
                 curl -sL https://github.com/elliotttate/FCPBridge/archive/refs/heads/main.zip \
@@ -206,34 +218,31 @@ class PatcherModel: ObservableObject {
             guard FileManager.default.fileExists(atPath: repoSources) else {
                 throw PatchError.msg("Failed to download FCPBridge sources. Make sure you have an internet connection.\n\(dlResult)")
             }
-            appendLog("Downloaded FCPBridge sources")
+            await logAsync("Downloaded FCPBridge sources")
         } else {
-            appendLog("FCPBridge sources: OK")
+            await logAsync("FCPBridge sources: OK")
         }
-        await completeStep(.checkPrereqs)
+        await completeStepAsync(.checkPrereqs)
 
         // Step 2: Copy app
-        await setStep(.copyApp)
+        await setStepAsync(.copyApp)
         if !FileManager.default.fileExists(atPath: moddedApp) {
-            appendLog("Copying FCP (~6GB, please wait)...")
+            await logAsync("Copying FCP (~6GB, please wait)...")
             let r = shell("mkdir -p '\(destDir)' && cp -R '\(sourceApp)' '\(moddedApp)' 2>&1")
             if !FileManager.default.fileExists(atPath: moddedApp) {
                 throw PatchError.msg("Copy failed: \(r)")
             }
-            // Copy receipt
             shell("mkdir -p '\(moddedApp)/Contents/_MASReceipt' && cp '\(sourceApp)/Contents/_MASReceipt/receipt' '\(moddedApp)/Contents/_MASReceipt/' 2>/dev/null")
-            // Remove quarantine
             shell("xattr -cr '\(moddedApp)' 2>/dev/null")
-            appendLog("Copied to \(destDir)")
+            await logAsync("Copied to \(destDir)")
         } else {
-            appendLog("Using existing copy")
+            await logAsync("Using existing copy")
         }
-        await completeStep(.copyApp)
+        await completeStepAsync(.copyApp)
 
         // Step 3: Build dylib
-        await setStep(.buildDylib)
-        appendLog("Compiling FCPBridge dylib...")
-        // Use a writable temp location for build output (repoDir may be read-only in app bundle)
+        await setStepAsync(.buildDylib)
+        await logAsync("Compiling FCPBridge dylib...")
         let buildDir = NSTemporaryDirectory() + "FCPBridge_build"
         shell("mkdir -p '\(buildDir)'")
         let sources = ["FCPBridge.m", "FCPBridgeRuntime.m", "FCPBridgeSwizzle.m", "FCPBridgeServer.m", "FCPTranscriptPanel.m"]
@@ -250,11 +259,11 @@ class PatcherModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: buildDir + "/FCPBridge") else {
             throw PatchError.msg("Build failed:\n\(buildResult)")
         }
-        appendLog("Built universal dylib (arm64 + x86_64)")
-        await completeStep(.buildDylib)
+        await logAsync("Built universal dylib (arm64 + x86_64)")
+        await completeStepAsync(.buildDylib)
 
         // Step 4: Install framework
-        await setStep(.installFramework)
+        await setStepAsync(.installFramework)
         let fwDir = moddedApp + "/Contents/Frameworks/FCPBridge.framework"
         shell("""
             mkdir -p '\(fwDir)/Versions/A/Resources'
@@ -263,48 +272,47 @@ class PatcherModel: ObservableObject {
             cd '\(fwDir)' && ln -sf Versions/Current/FCPBridge FCPBridge
             cd '\(fwDir)' && ln -sf Versions/Current/Resources Resources
             """)
-        // Info.plist
         let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
             <plist version="1.0"><dict>
             <key>CFBundleIdentifier</key><string>com.fcpbridge.FCPBridge</string>
             <key>CFBundleName</key><string>FCPBridge</string>
-            <key>CFBundleVersion</key><string>2.0.0</string>
+            <key>CFBundleVersion</key><string>2.1.0</string>
             <key>CFBundlePackageType</key><string>FMWK</string>
             <key>CFBundleExecutable</key><string>FCPBridge</string>
             </dict></plist>
             """
         try plist.write(toFile: fwDir + "/Versions/A/Resources/Info.plist", atomically: true, encoding: .utf8)
-        appendLog("Framework installed")
-        await completeStep(.installFramework)
+        await logAsync("Framework installed")
+        await completeStepAsync(.installFramework)
 
         // Step 5: Inject LC_LOAD_DYLIB
-        await setStep(.injectDylib)
+        await setStepAsync(.injectDylib)
         let binary = moddedApp + "/Contents/MacOS/Final Cut Pro"
         let alreadyInjected = shell("otool -L '\(binary)' 2>/dev/null | grep FCPBridge")
         if alreadyInjected.isEmpty {
-            // Build insert_dylib
             let insertDylib = "/tmp/fcpbridge_insert_dylib"
             if !FileManager.default.fileExists(atPath: insertDylib) {
-                appendLog("Building insert_dylib tool...")
+                await logAsync("Building insert_dylib tool...")
                 shell("""
                     cd /tmp && rm -rf _insert_dylib_build && mkdir _insert_dylib_build && cd _insert_dylib_build && \
-                    git clone --quiet https://github.com/tyilo/insert_dylib.git 2>/dev/null && \
-                    clang -o '\(insertDylib)' insert_dylib/insert_dylib/main.c -framework Foundation 2>/dev/null && \
+                    curl -sL https://github.com/tyilo/insert_dylib/archive/refs/heads/master.zip -o insert_dylib.zip && \
+                    unzip -qo insert_dylib.zip && \
+                    clang -o '\(insertDylib)' insert_dylib-master/insert_dylib/main.c -framework Foundation 2>/dev/null && \
                     cd /tmp && rm -rf _insert_dylib_build
                     """)
             }
-            let injectResult = shell("'\(insertDylib)' --inplace --all-yes '@rpath/FCPBridge.framework/Versions/A/FCPBridge' '\(binary)' 2>&1")
-            appendLog("Injected LC_LOAD_DYLIB")
+            shell("'\(insertDylib)' --inplace --all-yes '@rpath/FCPBridge.framework/Versions/A/FCPBridge' '\(binary)' 2>&1")
+            await logAsync("Injected LC_LOAD_DYLIB")
         } else {
-            appendLog("Already injected (skipping)")
+            await logAsync("Already injected (skipping)")
         }
-        await completeStep(.injectDylib)
+        await completeStepAsync(.injectDylib)
 
         // Step 6: Re-sign
-        await setStep(.signApp)
-        appendLog("Signing frameworks and plugins...")
+        await setStepAsync(.signApp)
+        await logAsync("Signing frameworks and plugins...")
         let entitlements = buildDir + "/entitlements.plist"
         let entPlist = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -317,10 +325,8 @@ class PatcherModel: ObservableObject {
             """
         try entPlist.write(toFile: entitlements, atomically: true, encoding: .utf8)
 
-        // Add speech recognition usage description for transcript feature
         shell("/usr/libexec/PlistBuddy -c \"Add :NSSpeechRecognitionUsageDescription string 'FCPBridge uses speech recognition to transcribe timeline audio for text-based editing.'\" '\(moddedApp)/Contents/Info.plist' 2>/dev/null")
 
-        // Sign everything
         shell("""
             for fw in '\(moddedApp)'/Contents/Frameworks/*.framework; do codesign --force --sign - "$fw" 2>/dev/null; done
             find '\(moddedApp)/Contents/PlugIns' \\( -name '*.bundle' -o -name '*.appex' -o -name '*.pluginkit' -o -name '*.fxp' \\) -type d | while read p; do codesign --force --sign - "$p" 2>/dev/null; done
@@ -334,35 +340,35 @@ class PatcherModel: ObservableObject {
 
         let verify = shell("codesign --verify --verbose '\(moddedApp)' 2>&1")
         if verify.contains("valid") || verify.contains("satisfies") {
-            appendLog("Signature verified")
+            await logAsync("Signature verified")
         } else {
             throw PatchError.msg("Signing failed: \(verify)")
         }
-        await completeStep(.signApp)
+        await completeStepAsync(.signApp)
 
         // Step 7: Defaults
-        await setStep(.configureDefaults)
+        await setStepAsync(.configureDefaults)
         shell("defaults write com.apple.FinalCut CloudContentFirstLaunchCompleted -bool true 2>/dev/null")
         shell("defaults write com.apple.FinalCut FFCloudContentDisabled -bool true 2>/dev/null")
-        appendLog("CloudContent defaults configured")
-        await completeStep(.configureDefaults)
+        await logAsync("CloudContent defaults configured")
+        await completeStepAsync(.configureDefaults)
 
         // Step 8: MCP
-        await setStep(.setupMCP)
+        await setStepAsync(.setupMCP)
         let mcpServer = repoDir + "/mcp/server.py"
         if FileManager.default.fileExists(atPath: mcpServer) {
-            appendLog("MCP server: \(mcpServer)")
+            await logAsync("MCP server: \(mcpServer)")
         }
-        await completeStep(.setupMCP)
+        await completeStepAsync(.setupMCP)
 
-        await setStep(.done)
-        appendLog("\nPatching complete! You can now launch the modded FCP.")
+        await setStepAsync(.done)
+        await logAsync("\nPatching complete! You can now launch the modded FCP.")
     }
 
     // MARK: - Helpers
 
     @discardableResult
-    func shell(_ command: String) -> String {
+    nonisolated func shell(_ command: String) -> String {
         let process = Process()
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -377,6 +383,18 @@ class PatcherModel: ObservableObject {
 
     private func appendLog(_ text: String) {
         log += text + "\n"
+    }
+
+    private nonisolated func logAsync(_ text: String) async {
+        await MainActor.run { self.log += text + "\n" }
+    }
+
+    private nonisolated func setStepAsync(_ step: PatchStep) async {
+        await MainActor.run { self.currentStep = step }
+    }
+
+    private nonisolated func completeStepAsync(_ step: PatchStep) async {
+        await MainActor.run { self.completedSteps.insert(step) }
     }
 
     private func setStep(_ step: PatchStep) async {
@@ -427,6 +445,7 @@ struct ContentView: View {
             actionBar
         }
         .frame(width: 580, height: 620)
+        .clipped()
     }
 
     // MARK: - Header
@@ -633,7 +652,9 @@ struct ContentView: View {
                 .disabled(model.isPatching)
             }
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity)
         .background(.bar)
     }
 }
