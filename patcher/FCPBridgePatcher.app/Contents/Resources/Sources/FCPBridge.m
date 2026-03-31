@@ -243,8 +243,6 @@ static id FCPBridge_toolbar_itemForItemIdentifier(id self, SEL _cmd, NSToolbar *
 
         [FCPBridgeMenuController shared].toolbarButton = button;
         item.view = button;
-        item.minSize = NSMakeSize(32, 25);
-        item.maxSize = NSMakeSize(32, 25);
 
         return item;
     }

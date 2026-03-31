@@ -233,14 +233,16 @@ class PatcherModel: ObservableObject {
         // Step 3: Build dylib
         await setStep(.buildDylib)
         appendLog("Compiling FCPBridge dylib...")
-        let buildDir = repoDir + "/build"
+        // Use a writable temp location for build output (repoDir may be read-only in app bundle)
+        let buildDir = NSTemporaryDirectory() + "FCPBridge_build"
         shell("mkdir -p '\(buildDir)'")
         let sources = ["FCPBridge.m", "FCPBridgeRuntime.m", "FCPBridgeSwizzle.m", "FCPBridgeServer.m", "FCPTranscriptPanel.m"]
             .map { "'\(repoDir)/Sources/\($0)'" }.joined(separator: " ")
         let buildResult = shell("""
             clang -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 \
             -framework Foundation -framework AppKit -framework AVFoundation \
-            -fobjc-arc -fmodules -undefined dynamic_lookup -dynamiclib \
+            -fobjc-arc -fmodules -Wno-deprecated-declarations \
+            -undefined dynamic_lookup -dynamiclib \
             -install_name @rpath/FCPBridge.framework/Versions/A/FCPBridge \
             -I '\(repoDir)/Sources' \
             \(sources) -o '\(buildDir)/FCPBridge' 2>&1
