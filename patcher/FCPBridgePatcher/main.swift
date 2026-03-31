@@ -42,21 +42,34 @@ class PatcherModel: ObservableObject {
     init() {
         destDir = NSHomeDirectory() + "/Desktop/FinalCutPro_Modded"
         moddedApp = destDir + "/Final Cut Pro.app"
-        // Find repo dir relative to this app or use default
+        // Find repo dir: check several locations, fall back to a cache dir for cloning
+        var found = ""
+        // 1. Relative to app bundle (when run from repo)
         let bundlePath = Bundle.main.bundlePath
-        if bundlePath.contains("FCPBridge") {
-            repoDir = (bundlePath as NSString).deletingLastPathComponent
-            // Go up until we find Sources/
-            var dir = repoDir
-            for _ in 0..<5 {
-                if FileManager.default.fileExists(atPath: dir + "/Sources/FCPBridge.m") {
-                    break
-                }
-                dir = (dir as NSString).deletingLastPathComponent
+        var dir = (bundlePath as NSString).deletingLastPathComponent
+        for _ in 0..<5 {
+            if FileManager.default.fileExists(atPath: dir + "/Sources/FCPBridge.m") {
+                found = dir; break
             }
-        } else {
-            repoDir = NSHomeDirectory() + "/Documents/GitHub/FCPBridge"
+            dir = (dir as NSString).deletingLastPathComponent
         }
+        // 2. Common locations
+        if found.isEmpty {
+            for path in [
+                NSHomeDirectory() + "/Documents/GitHub/FCPBridge",
+                NSHomeDirectory() + "/Desktop/FCPBridge",
+                NSHomeDirectory() + "/FCPBridge",
+            ] {
+                if FileManager.default.fileExists(atPath: path + "/Sources/FCPBridge.m") {
+                    found = path; break
+                }
+            }
+        }
+        // 3. Fall back to cache dir (will clone into it during patch)
+        if found.isEmpty {
+            found = NSHomeDirectory() + "/Library/Caches/FCPBridge"
+        }
+        repoDir = found
         checkStatus()
     }
 
@@ -162,10 +175,19 @@ class PatcherModel: ObservableObject {
         appendLog("FCP \(fcpVersion): OK")
 
         let repoSources = repoDir + "/Sources/FCPBridge.m"
-        guard FileManager.default.fileExists(atPath: repoSources) else {
-            throw PatchError.msg("FCPBridge sources not found. Expected at: \(repoDir)/Sources/")
+        if !FileManager.default.fileExists(atPath: repoSources) {
+            appendLog("Downloading FCPBridge sources...")
+            let cloneResult = shell("""
+                rm -rf '\(repoDir)' && \
+                git clone --depth 1 https://github.com/elliotttate/FCPBridge.git '\(repoDir)' 2>&1
+                """)
+            guard FileManager.default.fileExists(atPath: repoSources) else {
+                throw PatchError.msg("Failed to download FCPBridge sources. Git output:\n\(cloneResult)")
+            }
+            appendLog("Downloaded FCPBridge sources")
+        } else {
+            appendLog("FCPBridge sources: OK")
         }
-        appendLog("FCPBridge sources: OK")
         await completeStep(.checkPrereqs)
 
         // Step 2: Copy app
@@ -191,11 +213,11 @@ class PatcherModel: ObservableObject {
         appendLog("Compiling FCPBridge dylib...")
         let buildDir = repoDir + "/build"
         shell("mkdir -p '\(buildDir)'")
-        let sources = ["FCPBridge.m", "FCPBridgeRuntime.m", "FCPBridgeSwizzle.m", "FCPBridgeServer.m"]
+        let sources = ["FCPBridge.m", "FCPBridgeRuntime.m", "FCPBridgeSwizzle.m", "FCPBridgeServer.m", "FCPTranscriptPanel.m"]
             .map { "'\(repoDir)/Sources/\($0)'" }.joined(separator: " ")
         let buildResult = shell("""
             clang -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 \
-            -framework Foundation -framework AppKit \
+            -framework Foundation -framework AppKit -framework AVFoundation \
             -fobjc-arc -fmodules -undefined dynamic_lookup -dynamiclib \
             -install_name @rpath/FCPBridge.framework/Versions/A/FCPBridge \
             -I '\(repoDir)/Sources' \
@@ -270,6 +292,9 @@ class PatcherModel: ObservableObject {
             </dict></plist>
             """
         try entPlist.write(toFile: entitlements, atomically: true, encoding: .utf8)
+
+        // Add speech recognition usage description for transcript feature
+        shell("/usr/libexec/PlistBuddy -c \"Add :NSSpeechRecognitionUsageDescription string 'FCPBridge uses speech recognition to transcribe timeline audio for text-based editing.'\" '\(moddedApp)/Contents/Info.plist' 2>/dev/null")
 
         // Sign everything
         shell("""
