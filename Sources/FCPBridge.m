@@ -397,6 +397,22 @@ static BOOL returnNO(id self, SEL _cmd) {
     return NO;
 }
 
+static void noopMethodWith2Args(id self, SEL _cmd, id arg1, id arg2) {}
+
+static void FCPBridge_fixShutdownHang(void) {
+    // FCP's PCUserDefaultsMigrator.copyUserDefaultsToGroupContainer hangs on quit
+    // by enumerating a huge media directory via getattrlistbulk. Swizzle it to no-op.
+    Class migrator = objc_getClass("PCUserDefaultsMigrator");
+    if (migrator) {
+        SEL sel = NSSelectorFromString(@"copyDataFromSource:toTarget:");
+        Method m = class_getInstanceMethod(migrator, sel);
+        if (m) {
+            method_setImplementation(m, (IMP)noopMethodWith2Args);
+            FCPBridge_log(@"Swizzled PCUserDefaultsMigrator.copyDataFromSource: (fixes shutdown hang)");
+        }
+    }
+}
+
 static void FCPBridge_disableCloudContent(void) {
     FCPBridge_log(@"Disabling CloudContent/ImagePlayground...");
 
@@ -456,6 +472,9 @@ static void FCPBridge_init(void) {
 
     // Swizzle out CloudContent first-launch flow that crashes without iCloud entitlements
     FCPBridge_disableCloudContent();
+
+    // Fix shutdown hang caused by PCUserDefaultsMigrator
+    FCPBridge_fixShutdownHang();
 
     // Register for app launch notification
     [[NSNotificationCenter defaultCenter]
