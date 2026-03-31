@@ -197,3 +197,8 @@ explore_class("FFAnchoredTimelineModule")              # full overview
 search_methods("FFAnchoredTimelineModule", "blade")    # find methods
 get_methods("FFEffectStack")                           # all methods
 ```
+
+## Full API Reference
+See `docs/FCP_API_REFERENCE.md` for comprehensive documentation of all key classes,
+methods, properties, notifications, and patterns. This reference is sufficient to use
+FCPBridge without access to the decompiled FCP source code.
