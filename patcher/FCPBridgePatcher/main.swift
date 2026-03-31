@@ -42,18 +42,33 @@ class PatcherModel: ObservableObject {
     init() {
         destDir = NSHomeDirectory() + "/Desktop/FinalCutPro_Modded"
         moddedApp = destDir + "/Final Cut Pro.app"
-        // Find repo dir: check several locations, fall back to a cache dir for cloning
+        // Find FCPBridge sources. Priority:
+        // 1. Embedded in app bundle (Resources/Sources/) — self-contained release
+        // 2. Relative to app bundle (developer running from repo checkout)
+        // 3. Common local paths
+        // 4. Cache dir (will download into it during patch)
         var found = ""
-        // 1. Relative to app bundle (when run from repo)
-        let bundlePath = Bundle.main.bundlePath
-        var dir = (bundlePath as NSString).deletingLastPathComponent
-        for _ in 0..<5 {
-            if FileManager.default.fileExists(atPath: dir + "/Sources/FCPBridge.m") {
-                found = dir; break
+
+        // 1. Embedded in app bundle
+        if let resourcePath = Bundle.main.resourcePath {
+            let embedded = resourcePath + "/Sources"
+            if FileManager.default.fileExists(atPath: embedded + "/FCPBridge.m") {
+                found = resourcePath
             }
-            dir = (dir as NSString).deletingLastPathComponent
         }
-        // 2. Common locations
+
+        // 2. Relative to app bundle (developer workflow)
+        if found.isEmpty {
+            var dir = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
+            for _ in 0..<5 {
+                if FileManager.default.fileExists(atPath: dir + "/Sources/FCPBridge.m") {
+                    found = dir; break
+                }
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+        }
+
+        // 3. Common locations
         if found.isEmpty {
             for path in [
                 NSHomeDirectory() + "/Documents/GitHub/FCPBridge",
@@ -65,7 +80,8 @@ class PatcherModel: ObservableObject {
                 }
             }
         }
-        // 3. Fall back to cache dir (will clone into it during patch)
+
+        // 4. Cache dir (download during patch)
         if found.isEmpty {
             found = NSHomeDirectory() + "/Library/Caches/FCPBridge"
         }
@@ -164,8 +180,10 @@ class PatcherModel: ObservableObject {
     private func runPatch() async throws {
         // Step 1: Prerequisites
         await setStep(.checkPrereqs)
-        guard shell("xcode-select -p 2>/dev/null") != "" else {
-            throw PatchError.msg("Xcode Command Line Tools not installed. Run: xcode-select --install")
+        if shell("xcode-select -p 2>/dev/null").isEmpty {
+            appendLog("Xcode Command Line Tools not found. Installing...")
+            shell("xcode-select --install 2>/dev/null")
+            throw PatchError.msg("Xcode Command Line Tools are required.\n\nAn installer window should have appeared. Please complete the installation, then click \"Patch Final Cut Pro\" again.")
         }
         appendLog("Xcode tools: OK")
 
@@ -177,12 +195,16 @@ class PatcherModel: ObservableObject {
         let repoSources = repoDir + "/Sources/FCPBridge.m"
         if !FileManager.default.fileExists(atPath: repoSources) {
             appendLog("Downloading FCPBridge sources...")
-            let cloneResult = shell("""
-                rm -rf '\(repoDir)' && \
-                git clone --depth 1 https://github.com/elliotttate/FCPBridge.git '\(repoDir)' 2>&1
+            let dlResult = shell("""
+                mkdir -p '\(repoDir)' && \
+                curl -sL https://github.com/elliotttate/FCPBridge/archive/refs/heads/main.zip \
+                    -o /tmp/fcpbridge_src.zip && \
+                unzip -qo /tmp/fcpbridge_src.zip -d /tmp/fcpbridge_extract && \
+                cp -R /tmp/fcpbridge_extract/FCPBridge-main/* '\(repoDir)/' && \
+                rm -rf /tmp/fcpbridge_src.zip /tmp/fcpbridge_extract 2>&1
                 """)
             guard FileManager.default.fileExists(atPath: repoSources) else {
-                throw PatchError.msg("Failed to download FCPBridge sources. Git output:\n\(cloneResult)")
+                throw PatchError.msg("Failed to download FCPBridge sources. Make sure you have an internet connection.\n\(dlResult)")
             }
             appendLog("Downloaded FCPBridge sources")
         } else {
