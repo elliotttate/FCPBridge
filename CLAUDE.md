@@ -155,18 +155,30 @@ analyze_timeline()  # pacing, flash frames, clip stats
 ```
 open_transcript()                              # transcribe all clips on timeline
 open_transcript(file_url="/path/to/video.mp4") # transcribe a specific file
-get_transcript()                               # get words with timestamps
+get_transcript()                               # get words with timestamps + speakers + silences
 delete_transcript_words(start_index=5, count=3) # delete words 5-7 (removes video segment)
 move_transcript_words(start_index=10, count=2, dest_index=3) # reorder clips
+search_transcript("hello")                     # search for text in transcript
+search_transcript("pauses")                    # find all silences/pauses
+delete_transcript_silences()                   # batch-remove all silences from timeline
+delete_transcript_silences(min_duration=1.0)   # remove only silences > 1 second
+set_transcript_speaker(start_index=0, count=50, speaker="Host")  # label speakers
+set_silence_threshold(threshold=0.5)           # set minimum pause detection (seconds)
 close_transcript()                             # close the panel
 ```
 
 The transcript panel opens inside FCP as a floating window:
-- Shows transcribed text with word-level timestamps and confidence scores
+- Shows transcribed text grouped by **speaker segments** with timecode ranges (HH:MM:SS:FF)
+- **Silence markers** `[⋯]` shown inline between words where pauses are detected
 - Click a word to jump the playhead to that time
+- Click a silence marker to jump to that pause
 - Select words and press Delete to remove those video segments (ripple delete)
+- Select silence markers and press Delete to remove pauses
 - Drag words to reorder clips on the timeline
 - Current word is highlighted as playback progresses
+- **Search bar** with text search and filter by Pauses or Low Confidence
+- **Batch operations**: Delete all search results or delete all silences
+- Result count with prev/next navigation (Cmd+F to focus search)
 
 Deleting words performs: blade at start -> blade at end -> select segment -> delete
 Moving words performs: blade + cut at source -> move playhead -> paste at destination

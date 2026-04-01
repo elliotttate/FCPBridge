@@ -3,6 +3,9 @@
 //  Text-based video editing via speech transcription
 //
 //  Creates a floating panel inside FCP that shows a transcript of timeline clips.
+//  Features: silence detection with [...] markers, speaker segments with timestamps,
+//  search/filter, batch silence removal, and Premiere-style UI.
+//
 //  Deleting words removes the corresponding video segments.
 //  Dragging words reorders clips on the timeline.
 //
@@ -33,17 +36,59 @@ static void FCPTranscript_loadSpeechFramework(void) {
     });
 }
 
+// macOS 26+ check for speaker diarization support
+static BOOL FCPTranscript_isSpeakerDiarizationAvailable(void) {
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    // macOS 26 (Darwin 25.x) added SFSpeechRecognitionRequest.addsSpeakerAttribution
+    return v.majorVersion >= 26;
+}
+
+#pragma mark - Timecode Formatting
+
+static NSString *FCPTranscript_timecodeFromSeconds(double seconds, double fps) {
+    if (fps <= 0) fps = 24;
+    if (seconds < 0) seconds = 0;
+    int totalFrames = (int)(seconds * fps + 0.5);
+    int fpsInt = (int)(fps + 0.5);
+    if (fpsInt <= 0) fpsInt = 24;
+    int frames = totalFrames % fpsInt;
+    int totalSecs = totalFrames / fpsInt;
+    int secs = totalSecs % 60;
+    int mins = (totalSecs / 60) % 60;
+    int hours = totalSecs / 3600;
+    return [NSString stringWithFormat:@"%02d:%02d:%02d:%02d", hours, mins, secs, frames];
+}
+
 #pragma mark - FCPTranscriptWord
 
 @implementation FCPTranscriptWord
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _speaker = @"Unknown";
+    }
+    return self;
+}
 
 - (double)endTime {
     return _startTime + _duration;
 }
 
 - (NSString *)description {
-    return [NSString stringWithFormat:@"Word[%lu]: \"%@\" %.2f-%.2f (conf:%.0f%%)",
-            (unsigned long)_wordIndex, _text, _startTime, self.endTime, _confidence * 100];
+    return [NSString stringWithFormat:@"Word[%lu]: \"%@\" %.2f-%.2f (conf:%.0f%% speaker:%@)",
+            (unsigned long)_wordIndex, _text, _startTime, self.endTime, _confidence * 100, _speaker];
+}
+
+@end
+
+#pragma mark - FCPTranscriptSilence
+
+@implementation FCPTranscriptSilence
+
+- (NSString *)description {
+    return [NSString stringWithFormat:@"Silence: %.2f-%.2f (%.2fs) after word %lu",
+            _startTime, _endTime, _duration, (unsigned long)_afterWordIndex];
 }
 
 @end
@@ -56,9 +101,18 @@ static void FCPTranscript_loadSpeechFramework(void) {
 - (void)handleDropOfWordStart:(NSUInteger)srcStart count:(NSUInteger)srcCount atCharIndex:(NSUInteger)charIdx;
 - (NSUInteger)wordIndexAtCharIndex:(NSUInteger)charIdx;
 - (NSRange)selectedWordRange;
+- (void)focusSearchField;
 @end
 
 static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transcript.words";
+
+// Custom attribute keys for tracking what's at each position in the text view
+static NSString *const FCPAttrItemType = @"FCPItemType";
+static NSString *const FCPAttrWordIndex = @"FCPWordIndex";
+static NSString *const FCPAttrSilenceIndex = @"FCPSilenceIndex";
+static NSString *const FCPAttrSpeakerName = @"FCPSpeakerName";
+static NSString *const FCPAttrSegmentStartIndex = @"FCPSegmentStartIndex";
+static NSString *const FCPAttrSegmentEndIndex = @"FCPSegmentEndIndex";
 
 #pragma mark - Custom Text View for Transcript
 
@@ -88,8 +142,6 @@ static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transc
     NSUInteger charIdx = [self characterIndexForInsertionAtPoint:point];
     NSRange sel = self.selectedRange;
     if (sel.length > 0 && charIdx >= sel.location && charIdx < NSMaxRange(sel)) {
-        // Inside selection — wait for drag threshold before deciding
-        // Don't call super yet; we'll handle in mouseDragged
         return;
     }
 
@@ -121,12 +173,10 @@ static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transc
 
 - (void)mouseUp:(NSEvent *)event {
     if (!self.isDragging) {
-        // If we suppressed super mouseDown (inside selection), treat as click
         NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
         NSUInteger charIdx = [self characterIndexForInsertionAtPoint:point];
         NSRange sel = self.selectedRange;
         if (sel.length > 0 && charIdx >= sel.location && charIdx < NSMaxRange(sel)) {
-            // Click inside selection without drag — jump playhead
             [self.transcriptPanel handleClickAtCharIndex:charIdx];
         }
     }
@@ -138,22 +188,18 @@ static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transc
     NSRange sel = self.selectedRange;
     if (sel.length == 0) return;
 
-    // Find which words are selected
     NSRange wordRange = [self.transcriptPanel selectedWordRange];
     if (wordRange.length == 0) return;
 
-    // Encode word range into pasteboard data
     NSString *data = [NSString stringWithFormat:@"%lu,%lu",
         (unsigned long)wordRange.location, (unsigned long)wordRange.length];
     NSPasteboardItem *pbItem = [[NSPasteboardItem alloc] init];
     [pbItem setString:data forType:FCPTranscriptWordDragType];
 
-    // Get the text being dragged for the visual
     NSString *dragText = [[self.textStorage string] substringWithRange:sel];
 
     NSDraggingItem *dragItem = [[NSDraggingItem alloc] initWithPasteboardWriter:pbItem];
 
-    // Create a simple drag image from the selected text
     NSDictionary *attrs = @{
         NSFontAttributeName: [NSFont systemFontOfSize:16],
         NSForegroundColorAttributeName: [NSColor labelColor],
@@ -200,7 +246,6 @@ static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transc
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
     NSPasteboard *pb = [sender draggingPasteboard];
     if ([pb availableTypeFromArray:@[FCPTranscriptWordDragType]]) {
-        // Show insertion cursor at drop point
         NSPoint point = [self convertPoint:[sender draggingLocation] fromView:nil];
         NSUInteger charIdx = [self characterIndexForInsertionAtPoint:point];
         [self setSelectedRange:NSMakeRange(charIdx, 0)];
@@ -242,9 +287,8 @@ static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transc
     NSString *chars = event.charactersIgnoringModifiers;
     if ([chars isEqualToString:@" "] ||
         [chars isEqualToString:@"j"] || [chars isEqualToString:@"k"] || [chars isEqualToString:@"l"]) {
-        // Send as action through NSApp so FCP's player module picks it up
         if ([chars isEqualToString:@" "]) {
-            [[NSApp mainWindow] makeKeyWindow]; // give focus back briefly
+            [[NSApp mainWindow] makeKeyWindow];
             ((BOOL (*)(id, SEL, SEL, id, id))objc_msgSend)(
                 [NSApp class] == nil ? nil : NSApp,
                 @selector(sendAction:to:from:),
@@ -262,8 +306,13 @@ static NSPasteboardType const FCPTranscriptWordDragType = @"com.fcpbridge.transc
         return;
     }
 
-    // Cmd+A (select all), Cmd+Z (undo) → pass through
+    // Cmd+A (select all), Cmd+Z (undo), Cmd+F (find) → pass through
     if (event.modifierFlags & NSEventModifierFlagCommand) {
+        // Cmd+F → focus search field
+        if ([chars isEqualToString:@"f"]) {
+            [self.transcriptPanel focusSearchField];
+            return;
+        }
         [super keyDown:event];
         return;
     }
@@ -283,7 +332,7 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     return (t.timescale > 0) ? (double)t.value / t.timescale : 0;
 }
 
-@interface FCPTranscriptPanel () <NSTextViewDelegate, NSWindowDelegate>
+@interface FCPTranscriptPanel () <NSTextViewDelegate, NSWindowDelegate, NSSearchFieldDelegate>
 @property (nonatomic, strong) NSPanel *panel;
 @property (nonatomic, strong) FCPTranscriptTextView *textView;
 @property (nonatomic, strong) NSScrollView *scrollView;
@@ -292,8 +341,19 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 @property (nonatomic, strong) NSButton *refreshButton;
 @property (nonatomic, strong) NSTimer *playheadTimer;
 
+// Search & Filter UI
+@property (nonatomic, strong) NSSearchField *searchField;
+@property (nonatomic, strong) NSPopUpButton *filterPopup;
+@property (nonatomic, strong) NSButton *deleteResultsButton;
+@property (nonatomic, strong) NSButton *deleteSilencesButton;
+@property (nonatomic, strong) NSTextField *resultCountLabel;
+@property (nonatomic, strong) NSButton *prevResultButton;
+@property (nonatomic, strong) NSButton *nextResultButton;
+
+// Data
 @property (nonatomic, readwrite) FCPTranscriptStatus status;
 @property (nonatomic, readwrite, strong) NSMutableArray<FCPTranscriptWord *> *mutableWords;
+@property (nonatomic, readwrite, strong) NSMutableArray<FCPTranscriptSilence *> *mutableSilences;
 @property (nonatomic, readwrite, copy) NSString *fullText;
 @property (nonatomic, readwrite, copy) NSString *errorMessage;
 
@@ -302,6 +362,28 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 @property (nonatomic) NSUInteger completedTranscriptions;
 @property (nonatomic) NSUInteger totalTranscriptions;
 @property (nonatomic) BOOL suppressTextViewCallbacks;
+
+// Search state
+@property (nonatomic, strong) NSMutableArray<NSValue *> *searchResultRanges; // NSRange values
+@property (nonatomic) NSInteger currentSearchIndex;
+@property (nonatomic, copy) NSString *currentSearchQuery;
+@property (nonatomic, copy) NSString *currentFilter; // "all", "pauses", "lowConfidence"
+
+// Progress bar
+@property (nonatomic, strong) NSProgressIndicator *progressBar;
+
+// Playhead tracking — stores the last highlighted word range to avoid clearing the whole document
+@property (nonatomic) NSRange lastPlayheadHighlightRange;
+
+// Options menu
+@property (nonatomic, strong) NSPopUpButton *enginePopup;
+
+// Speaker diarization (macOS 26+)
+@property (nonatomic, strong) NSButton *speakerDetectionCheckbox;
+@property (nonatomic) BOOL speakerDetectionEnabled;
+
+// Frame rate for timecodes
+@property (nonatomic) double frameRate;
 @end
 
 @implementation FCPTranscriptPanel
@@ -322,8 +404,15 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     if (self) {
         _status = FCPTranscriptStatusIdle;
         _mutableWords = [NSMutableArray array];
+        _mutableSilences = [NSMutableArray array];
         _pendingTranscriptions = [NSMutableArray array];
-        FCPTranscript_loadSpeechFramework();
+        _searchResultRanges = [NSMutableArray array];
+        _currentSearchIndex = -1;
+        _currentFilter = @"all";
+        _silenceThreshold = 0.3; // 300ms default
+        _frameRate = 24.0;
+        _engine = FCPTranscriptEngineWhisper; // Default to Parakeet (fastest, most accurate)
+        _lastPlayheadHighlightRange = NSMakeRange(NSNotFound, 0);
 
         [[NSNotificationCenter defaultCenter]
             addObserverForName:NSApplicationWillTerminateNotification
@@ -342,8 +431,8 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
     FCPBridge_log(@"[Transcript] Setting up panel UI");
 
-    // Create floating panel
-    NSRect frame = NSMakeRect(100, 200, 500, 600);
+    // Create floating panel — wider for segment layout
+    NSRect frame = NSMakeRect(100, 150, 620, 700);
     NSUInteger styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskUtilityWindow;
 
@@ -356,106 +445,282 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     self.panel.becomesKeyOnlyIfNeeded = NO;
     self.panel.hidesOnDeactivate = NO;
     self.panel.level = NSFloatingWindowLevel;
-    self.panel.minSize = NSMakeSize(350, 300);
+    self.panel.minSize = NSMakeSize(420, 350);
     self.panel.delegate = self;
     self.panel.releasedWhenClosed = NO;
 
-    // Content view
+    // Dark appearance to match FCP
+    self.panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+
     NSView *content = self.panel.contentView;
     content.wantsLayer = YES;
-    content.layer.backgroundColor = [NSColor windowBackgroundColor].CGColor;
 
-    // Header area with status
-    NSView *header = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 50)];
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-    [content addSubview:header];
+    // ──── Row 1: Search + Filter + Transcribe ────
+    NSView *row1 = [[NSView alloc] init];
+    row1.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:row1];
 
-    // Status label
-    self.statusLabel = [NSTextField labelWithString:@"Ready - Open a project and click Transcribe"];
+    // Search field
+    self.searchField = [[NSSearchField alloc] init];
+    self.searchField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.searchField.placeholderString = @"Search transcript...";
+    self.searchField.delegate = self;
+    self.searchField.sendsSearchStringImmediately = YES;
+    self.searchField.sendsWholeSearchString = NO;
+    [row1 addSubview:self.searchField];
+
+    // Filter popup
+    self.filterPopup = [[NSPopUpButton alloc] init];
+    self.filterPopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.filterPopup addItemsWithTitles:@[@"All", @"Pauses", @"Low Confidence"]];
+    self.filterPopup.target = self;
+    self.filterPopup.action = @selector(filterChanged:);
+    [self.filterPopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row1 addSubview:self.filterPopup];
+
+    // Engine selector
+    self.enginePopup = [[NSPopUpButton alloc] init];
+    self.enginePopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.enginePopup addItemsWithTitles:@[@"FCP Native", @"Apple Speech", @"Parakeet"]];
+    self.enginePopup.target = self;
+    self.enginePopup.action = @selector(engineChanged:);
+    self.enginePopup.font = [NSFont systemFontOfSize:11];
+    self.enginePopup.controlSize = NSControlSizeSmall;
+    [self.enginePopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.enginePopup selectItemAtIndex:2]; // Default to Parakeet
+    [row1 addSubview:self.enginePopup];
+
+    // Speaker detection checkbox
+    self.speakerDetectionCheckbox = [NSButton checkboxWithTitle:@"Speakers"
+                                                        target:self
+                                                        action:@selector(speakerDetectionToggled:)];
+    self.speakerDetectionCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    self.speakerDetectionCheckbox.font = [NSFont systemFontOfSize:11];
+    self.speakerDetectionCheckbox.controlSize = NSControlSizeSmall;
+    [self.speakerDetectionCheckbox setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row1 addSubview:self.speakerDetectionCheckbox];
+    // Initial state: disabled when FCP Native is default engine
+    [self updateSpeakerCheckboxState];
+
+    // Transcribe button
+    self.refreshButton = [NSButton buttonWithTitle:@"Transcribe"
+                                            target:self
+                                            action:@selector(refreshClicked:)];
+    self.refreshButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.refreshButton.bezelStyle = NSBezelStyleRounded;
+    [self.refreshButton setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row1 addSubview:self.refreshButton];
+
+    // ──── Row 2: Delete buttons + Status/Spinner + Result nav ────
+    NSView *row2 = [[NSView alloc] init];
+    row2.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:row2];
+
+    // Delete results button
+    self.deleteResultsButton = [NSButton buttonWithTitle:@"Delete"
+                                                  target:self
+                                                  action:@selector(deleteResultsClicked:)];
+    self.deleteResultsButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.deleteResultsButton.bezelStyle = NSBezelStyleRounded;
+    self.deleteResultsButton.image = [NSImage imageWithSystemSymbolName:@"trash" accessibilityDescription:@"Delete"];
+    self.deleteResultsButton.imagePosition = NSImageLeading;
+    self.deleteResultsButton.enabled = NO;
+    [self.deleteResultsButton setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row2 addSubview:self.deleteResultsButton];
+
+    // Delete silences button
+    self.deleteSilencesButton = [NSButton buttonWithTitle:@"Delete Silences"
+                                                   target:self
+                                                   action:@selector(deleteSilencesClicked:)];
+    self.deleteSilencesButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.deleteSilencesButton.bezelStyle = NSBezelStyleRounded;
+    self.deleteSilencesButton.enabled = NO;
+    [self.deleteSilencesButton setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row2 addSubview:self.deleteSilencesButton];
+
+    // Status label + spinner
+    self.statusLabel = [NSTextField labelWithString:@"Ready"];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusLabel.font = [NSFont systemFontOfSize:12];
+    self.statusLabel.font = [NSFont systemFontOfSize:11];
     self.statusLabel.textColor = [NSColor secondaryLabelColor];
-    [header addSubview:self.statusLabel];
+    self.statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.statusLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row2 addSubview:self.statusLabel];
 
-    // Spinner
     self.spinner = [[NSProgressIndicator alloc] initWithFrame:NSZeroRect];
     self.spinner.style = NSProgressIndicatorStyleSpinning;
     self.spinner.translatesAutoresizingMaskIntoConstraints = NO;
     self.spinner.controlSize = NSControlSizeSmall;
     self.spinner.hidden = YES;
-    [header addSubview:self.spinner];
+    [row2 addSubview:self.spinner];
 
-    // Refresh button
-    self.refreshButton = [NSButton buttonWithTitle:@"Transcribe Timeline"
-                                            target:self
-                                            action:@selector(refreshClicked:)];
-    self.refreshButton.translatesAutoresizingMaskIntoConstraints = NO;
-    self.refreshButton.bezelStyle = NSBezelStyleRounded;
-    [header addSubview:self.refreshButton];
+    // Result count
+    self.resultCountLabel = [NSTextField labelWithString:@""];
+    self.resultCountLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.resultCountLabel.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
+    self.resultCountLabel.textColor = [NSColor secondaryLabelColor];
+    self.resultCountLabel.alignment = NSTextAlignmentRight;
+    [self.resultCountLabel setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row2 addSubview:self.resultCountLabel];
 
-    // Scroll view with text view
-    self.scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    // Prev/Next buttons
+    self.prevResultButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.up" accessibilityDescription:@"Previous"]
+                                               target:self
+                                               action:@selector(prevResultClicked:)];
+    self.prevResultButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.prevResultButton.bezelStyle = NSBezelStyleRounded;
+    self.prevResultButton.bordered = NO;
+    self.prevResultButton.enabled = NO;
+    [row2 addSubview:self.prevResultButton];
+
+    self.nextResultButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:@"Next"]
+                                               target:self
+                                               action:@selector(nextResultClicked:)];
+    self.nextResultButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.nextResultButton.bezelStyle = NSBezelStyleRounded;
+    self.nextResultButton.bordered = NO;
+    self.nextResultButton.enabled = NO;
+    [row2 addSubview:self.nextResultButton];
+
+    // ──── Progress bar (hidden by default, shown during transcription) ────
+    self.progressBar = [[NSProgressIndicator alloc] initWithFrame:NSZeroRect];
+    self.progressBar.translatesAutoresizingMaskIntoConstraints = NO;
+    self.progressBar.style = NSProgressIndicatorStyleBar;
+    self.progressBar.controlSize = NSControlSizeSmall;
+    self.progressBar.indeterminate = NO;
+    self.progressBar.minValue = 0;
+    self.progressBar.maxValue = 1.0;
+    self.progressBar.doubleValue = 0;
+    self.progressBar.hidden = YES;
+    [content addSubview:self.progressBar];
+
+    // ──── Scroll view with text view ────
+    // Create scroll view with a real initial frame so NSTextView can read contentSize.
+    // Auto Layout will override the frame later, but the initial size lets the text view
+    // configure its autoresizing geometry correctly.
+    self.scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 600, 500)];
     self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
     self.scrollView.hasVerticalScroller = YES;
     self.scrollView.hasHorizontalScroller = NO;
-    self.scrollView.borderType = NSBezelBorder;
+    self.scrollView.borderType = NSNoBorder;
+    self.scrollView.drawsBackground = YES;
+    self.scrollView.backgroundColor = [NSColor colorWithCalibratedWhite:0.15 alpha:1.0];
     [content addSubview:self.scrollView];
 
-    // Text view
-    NSSize contentSize = self.scrollView.contentSize;
+    // Text view — created using scrollView.contentSize so the initial frame matches
+    // the clip view. lineFragmentPadding provides left/right text padding within the
+    // text container; textContainerInset provides top/bottom only.
+    NSSize cs = self.scrollView.contentSize;
     self.textView = [[FCPTranscriptTextView alloc] initWithFrame:
-        NSMakeRect(0, 0, contentSize.width, contentSize.height)];
+        NSMakeRect(0, 0, cs.width, cs.height)];
     self.textView.transcriptPanel = self;
-    self.textView.minSize = NSMakeSize(0, contentSize.height);
+    self.textView.minSize = NSMakeSize(0, cs.height);
     self.textView.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
     self.textView.verticallyResizable = YES;
     self.textView.horizontallyResizable = NO;
     self.textView.autoresizingMask = NSViewWidthSizable;
-    self.textView.textContainer.containerSize = NSMakeSize(contentSize.width, FLT_MAX);
+    self.textView.textContainer.containerSize = NSMakeSize(cs.width, FLT_MAX);
     self.textView.textContainer.widthTracksTextView = YES;
-    self.textView.font = [NSFont systemFontOfSize:16];
+    self.textView.textContainer.lineFragmentPadding = 16;
+    self.textView.font = [NSFont systemFontOfSize:15];
     self.textView.textColor = [NSColor labelColor];
-    self.textView.backgroundColor = [NSColor textBackgroundColor];
+    self.textView.backgroundColor = [NSColor colorWithCalibratedWhite:0.15 alpha:1.0];
+    self.textView.insertionPointColor = [NSColor whiteColor];
     self.textView.editable = YES;
     self.textView.selectable = YES;
     self.textView.richText = YES;
-    self.textView.allowsUndo = NO; // We handle our own undo
+    self.textView.allowsUndo = NO;
     self.textView.delegate = self;
-    self.textView.textContainerInset = NSMakeSize(12, 12);
+    self.textView.textContainerInset = NSMakeSize(0, 12);
     self.scrollView.documentView = self.textView;
 
-    // Register for drag-and-drop of words
     [self.textView setupDragTypes];
 
     // Instructions text
     NSMutableAttributedString *instructions = [[NSMutableAttributedString alloc]
-        initWithString:@"Transcript Editor\n\nClick \"Transcribe Timeline\" to transcribe the audio from your timeline clips.\n\nOnce transcribed:\n  \u2022 Click a word to jump the playhead\n  \u2022 Select words and press Delete to remove those segments\n  \u2022 Drag words to reorder clips\n\nThe transcript stays synced with your timeline."
+        initWithString:@"Transcript Editor\n\nClick \"Transcribe\" to transcribe audio from your timeline clips.\n\nOnce transcribed:\n  \u2022 Click a word to jump the playhead\n  \u2022 Select words and press Delete to remove those segments\n  \u2022 Drag words to reorder clips\n  \u2022 Use Search to find text or filter Pauses\n  \u2022 Click \"Delete Silences\" to batch-remove pauses\n\nSilences are shown as [\u22ef] markers between words."
         attributes:@{
             NSFontAttributeName: [NSFont systemFontOfSize:14],
             NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
         }];
     [self.textView.textStorage setAttributedString:instructions];
 
-    // Auto Layout
+    // ──── Auto Layout ────
+
+    // Row 1
     [NSLayoutConstraint activateConstraints:@[
-        [header.topAnchor constraintEqualToAnchor:content.topAnchor constant:8],
-        [header.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
-        [header.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
-        [header.heightAnchor constraintEqualToConstant:40],
+        [row1.topAnchor constraintEqualToAnchor:content.topAnchor constant:10],
+        [row1.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
+        [row1.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
+        [row1.heightAnchor constraintEqualToConstant:28],
 
-        [self.statusLabel.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
-        [self.statusLabel.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [self.searchField.leadingAnchor constraintEqualToAnchor:row1.leadingAnchor],
+        [self.searchField.centerYAnchor constraintEqualToAnchor:row1.centerYAnchor],
 
-        [self.spinner.leadingAnchor constraintEqualToAnchor:self.statusLabel.trailingAnchor constant:8],
-        [self.spinner.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [self.filterPopup.leadingAnchor constraintEqualToAnchor:self.searchField.trailingAnchor constant:8],
+        [self.filterPopup.centerYAnchor constraintEqualToAnchor:row1.centerYAnchor],
+        [self.filterPopup.widthAnchor constraintGreaterThanOrEqualToConstant:100],
 
-        [self.refreshButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
-        [self.refreshButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [self.enginePopup.leadingAnchor constraintEqualToAnchor:self.filterPopup.trailingAnchor constant:6],
+        [self.enginePopup.centerYAnchor constraintEqualToAnchor:row1.centerYAnchor],
 
-        [self.scrollView.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:8],
-        [self.scrollView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
-        [self.scrollView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
-        [self.scrollView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-12],
+        [self.speakerDetectionCheckbox.leadingAnchor constraintEqualToAnchor:self.enginePopup.trailingAnchor constant:6],
+        [self.speakerDetectionCheckbox.centerYAnchor constraintEqualToAnchor:row1.centerYAnchor],
+
+        [self.refreshButton.leadingAnchor constraintEqualToAnchor:self.speakerDetectionCheckbox.trailingAnchor constant:6],
+        [self.refreshButton.trailingAnchor constraintEqualToAnchor:row1.trailingAnchor],
+        [self.refreshButton.centerYAnchor constraintEqualToAnchor:row1.centerYAnchor],
+
+        [self.searchField.trailingAnchor constraintEqualToAnchor:self.filterPopup.leadingAnchor constant:-8],
+    ]];
+
+    // Row 2
+    [NSLayoutConstraint activateConstraints:@[
+        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:6],
+        [row2.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
+        [row2.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
+        [row2.heightAnchor constraintEqualToConstant:24],
+
+        [self.deleteResultsButton.leadingAnchor constraintEqualToAnchor:row2.leadingAnchor],
+        [self.deleteResultsButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.deleteSilencesButton.leadingAnchor constraintEqualToAnchor:self.deleteResultsButton.trailingAnchor constant:6],
+        [self.deleteSilencesButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.deleteSilencesButton.trailingAnchor constant:8],
+        [self.statusLabel.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.spinner.leadingAnchor constraintEqualToAnchor:self.statusLabel.trailingAnchor constant:4],
+        [self.spinner.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.nextResultButton.trailingAnchor constraintEqualToAnchor:row2.trailingAnchor],
+        [self.nextResultButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+        [self.nextResultButton.widthAnchor constraintEqualToConstant:24],
+
+        [self.prevResultButton.trailingAnchor constraintEqualToAnchor:self.nextResultButton.leadingAnchor constant:-2],
+        [self.prevResultButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+        [self.prevResultButton.widthAnchor constraintEqualToConstant:24],
+
+        [self.resultCountLabel.trailingAnchor constraintEqualToAnchor:self.prevResultButton.leadingAnchor constant:-6],
+        [self.resultCountLabel.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.resultCountLabel.leadingAnchor constant:-8],
+    ]];
+
+    // Progress bar (full width, thin, between toolbar and scroll view)
+    [NSLayoutConstraint activateConstraints:@[
+        [self.progressBar.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:6],
+        [self.progressBar.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
+        [self.progressBar.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
+        [self.progressBar.heightAnchor constraintEqualToConstant:4],
+    ]];
+
+    // Scroll view
+    [NSLayoutConstraint activateConstraints:@[
+        [self.scrollView.topAnchor constraintEqualToAnchor:self.progressBar.bottomAnchor constant:4],
+        [self.scrollView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [self.scrollView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [self.scrollView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
     ]];
 }
 
@@ -465,7 +730,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self setupPanelIfNeeded];
         [self.panel makeKeyAndOrderFront:nil];
-        // Restart playhead sync if we have a transcript
         if (self.status == FCPTranscriptStatusReady && self.mutableWords.count > 0) {
             [self startPlayheadTimer];
         }
@@ -475,7 +739,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 - (void)hidePanel {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.panel orderOut:nil];
-        // Keep the timer running so highlights stay synced when panel is reopened
     });
 }
 
@@ -484,13 +747,336 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
-    // Don't stop timer — user may reopen the panel and expect sync to still work
+    // Don't stop timer — user may reopen and expect sync
 }
 
-#pragma mark - Refresh Button
+- (void)focusSearchField {
+    [self.panel makeKeyAndOrderFront:nil];
+    [self.searchField becomeFirstResponder];
+}
+
+#pragma mark - Button Actions
 
 - (void)refreshClicked:(id)sender {
     [self transcribeTimeline];
+}
+
+- (void)engineChanged:(id)sender {
+    NSString *selected = self.enginePopup.titleOfSelectedItem;
+    if ([selected isEqualToString:@"Apple Speech"]) {
+        self.engine = FCPTranscriptEngineAppleSpeech;
+        FCPBridge_log(@"[Transcript] Engine switched to Apple Speech (SFSpeechRecognizer)");
+    } else if ([selected isEqualToString:@"Parakeet"]) {
+        self.engine = FCPTranscriptEngineWhisper;
+        FCPBridge_log(@"[Transcript] Engine switched to Parakeet (FluidAudio)");
+    } else {
+        self.engine = FCPTranscriptEngineFCPNative;
+        FCPBridge_log(@"[Transcript] Engine switched to FCP Native (AASpeechAnalyzer)");
+    }
+    [self updateSpeakerCheckboxState];
+}
+
+- (void)speakerDetectionToggled:(id)sender {
+    self.speakerDetectionEnabled = (self.speakerDetectionCheckbox.state == NSControlStateValueOn);
+    FCPBridge_log(@"[Transcript] Speaker detection %@", self.speakerDetectionEnabled ? @"enabled" : @"disabled");
+}
+
+- (void)updateSpeakerCheckboxState {
+    BOOL macOS26 = FCPTranscript_isSpeakerDiarizationAvailable();
+    BOOL isAppleSpeech = (self.engine == FCPTranscriptEngineAppleSpeech);
+    BOOL isParakeet = (self.engine == FCPTranscriptEngineWhisper);
+
+    if (isParakeet) {
+        // Parakeet has built-in diarization via FluidAudio — always available
+        self.speakerDetectionCheckbox.enabled = YES;
+        self.speakerDetectionCheckbox.state = NSControlStateValueOn;
+        self.speakerDetectionEnabled = YES;
+        self.speakerDetectionCheckbox.toolTip = @"Detect different speakers (FluidAudio diarization)";
+    } else if (isAppleSpeech && macOS26) {
+        self.speakerDetectionCheckbox.enabled = YES;
+        self.speakerDetectionCheckbox.state = NSControlStateValueOn;
+        self.speakerDetectionEnabled = YES;
+        self.speakerDetectionCheckbox.toolTip = @"Detect different speakers (macOS 26+)";
+    } else if (isAppleSpeech) {
+        self.speakerDetectionCheckbox.enabled = NO;
+        self.speakerDetectionCheckbox.state = NSControlStateValueOff;
+        self.speakerDetectionEnabled = NO;
+        self.speakerDetectionCheckbox.toolTip = @"Speaker detection requires macOS 26 or later";
+    } else {
+        // FCP Native: no diarization
+        self.speakerDetectionCheckbox.enabled = NO;
+        self.speakerDetectionCheckbox.state = NSControlStateValueOff;
+        self.speakerDetectionEnabled = NO;
+        self.speakerDetectionCheckbox.toolTip = @"Speaker detection not available with FCP Native engine";
+    }
+}
+
+- (void)filterChanged:(id)sender {
+    NSString *selected = self.filterPopup.titleOfSelectedItem;
+    if ([selected isEqualToString:@"Pauses"]) {
+        self.currentFilter = @"pauses";
+        self.searchField.stringValue = @"";
+        self.currentSearchQuery = @"";
+    } else if ([selected isEqualToString:@"Low Confidence"]) {
+        self.currentFilter = @"lowConfidence";
+        self.searchField.stringValue = @"";
+        self.currentSearchQuery = @"";
+    } else {
+        self.currentFilter = @"all";
+    }
+    [self rebuildTextView];
+    [self performSearchHighlighting];
+}
+
+- (void)deleteResultsClicked:(id)sender {
+    if (self.searchResultRanges.count == 0) return;
+
+    // If filter is pauses, delete all silences
+    if ([self.currentFilter isEqualToString:@"pauses"]) {
+        [self deleteSilencesClicked:sender];
+        return;
+    }
+
+    // Delete selected search result words
+    // Collect word indices from search results (reverse order for safe deletion)
+    NSMutableArray<NSNumber *> *wordIndicesToDelete = [NSMutableArray array];
+    @synchronized (self.mutableWords) {
+        for (NSValue *rangeVal in self.searchResultRanges) {
+            NSRange range = rangeVal.rangeValue;
+            for (FCPTranscriptWord *word in self.mutableWords) {
+                NSRange intersection = NSIntersectionRange(range, word.textRange);
+                if (intersection.length > 0) {
+                    [wordIndicesToDelete addObject:@(word.wordIndex)];
+                }
+            }
+        }
+    }
+
+    if (wordIndicesToDelete.count == 0) return;
+
+    // Sort descending so we delete from end first
+    [wordIndicesToDelete sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [b compare:a];
+    }];
+
+    [self updateStatusUI:@"Deleting search results..."];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (NSNumber *idx in wordIndicesToDelete) {
+            [self deleteWordsFromIndex:idx.unsignedIntegerValue count:1];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatusUI:@"Deleted search results"];
+        });
+    });
+}
+
+- (void)deleteSilencesClicked:(id)sender {
+    [self deleteAllSilences];
+}
+
+- (void)prevResultClicked:(id)sender {
+    if (self.searchResultRanges.count == 0) return;
+    self.currentSearchIndex--;
+    if (self.currentSearchIndex < 0) {
+        self.currentSearchIndex = (NSInteger)self.searchResultRanges.count - 1;
+    }
+    [self scrollToCurrentSearchResult];
+}
+
+- (void)nextResultClicked:(id)sender {
+    if (self.searchResultRanges.count == 0) return;
+    self.currentSearchIndex++;
+    if (self.currentSearchIndex >= (NSInteger)self.searchResultRanges.count) {
+        self.currentSearchIndex = 0;
+    }
+    [self scrollToCurrentSearchResult];
+}
+
+#pragma mark - Search
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    if (notification.object == self.searchField) {
+        self.currentSearchQuery = self.searchField.stringValue;
+        // Reset filter to All when typing in search
+        if (self.currentSearchQuery.length > 0 && ![self.currentFilter isEqualToString:@"all"]) {
+            self.currentFilter = @"all";
+            [self.filterPopup selectItemWithTitle:@"All"];
+        }
+        [self performSearchHighlighting];
+    }
+}
+
+- (void)performSearchHighlighting {
+    [self.searchResultRanges removeAllObjects];
+    self.currentSearchIndex = -1;
+
+    NSTextStorage *storage = self.textView.textStorage;
+    NSRange fullRange = NSMakeRange(0, storage.length);
+    if (fullRange.length == 0) {
+        [self updateSearchResultsUI];
+        return;
+    }
+
+    // Clear previous search highlighting
+    self.suppressTextViewCallbacks = YES;
+    [storage removeAttribute:NSBackgroundColorAttributeName range:fullRange];
+
+    NSString *query = self.currentSearchQuery;
+    BOOL filterPauses = [self.currentFilter isEqualToString:@"pauses"];
+    BOOL filterLowConf = [self.currentFilter isEqualToString:@"lowConfidence"];
+
+    if (filterPauses) {
+        // Highlight all silence markers
+        for (FCPTranscriptSilence *silence in self.mutableSilences) {
+            if (silence.textRange.location + silence.textRange.length <= storage.length) {
+                [self.searchResultRanges addObject:[NSValue valueWithRange:silence.textRange]];
+                [storage addAttribute:NSBackgroundColorAttributeName
+                                value:[NSColor colorWithCalibratedRed:0.9 green:0.7 blue:0.2 alpha:0.5]
+                                range:silence.textRange];
+            }
+        }
+    } else if (filterLowConf) {
+        // Highlight low confidence words
+        @synchronized (self.mutableWords) {
+            for (FCPTranscriptWord *word in self.mutableWords) {
+                if (word.confidence < 0.5 && word.textRange.location + word.textRange.length <= storage.length) {
+                    [self.searchResultRanges addObject:[NSValue valueWithRange:word.textRange]];
+                    [storage addAttribute:NSBackgroundColorAttributeName
+                                    value:[NSColor colorWithCalibratedRed:0.9 green:0.5 blue:0.2 alpha:0.4]
+                                    range:word.textRange];
+                }
+            }
+        }
+    } else if (query.length > 0) {
+        // Text search
+        NSString *text = [storage string];
+        NSRange searchRange = NSMakeRange(0, text.length);
+        NSStringCompareOptions options = NSCaseInsensitiveSearch;
+
+        while (searchRange.location < text.length) {
+            NSRange foundRange = [text rangeOfString:query options:options range:searchRange];
+            if (foundRange.location == NSNotFound) break;
+
+            [self.searchResultRanges addObject:[NSValue valueWithRange:foundRange]];
+            [storage addAttribute:NSBackgroundColorAttributeName
+                            value:[NSColor colorWithCalibratedRed:0.9 green:0.7 blue:0.2 alpha:0.4]
+                            range:foundRange];
+
+            searchRange.location = NSMaxRange(foundRange);
+            searchRange.length = text.length - searchRange.location;
+        }
+    }
+
+    self.suppressTextViewCallbacks = NO;
+
+    if (self.searchResultRanges.count > 0) {
+        self.currentSearchIndex = 0;
+        [self scrollToCurrentSearchResult];
+    }
+
+    [self updateSearchResultsUI];
+}
+
+- (void)scrollToCurrentSearchResult {
+    if (self.currentSearchIndex < 0 || self.currentSearchIndex >= (NSInteger)self.searchResultRanges.count) return;
+
+    NSRange range = self.searchResultRanges[self.currentSearchIndex].rangeValue;
+
+    // Highlight current result more prominently
+    NSTextStorage *storage = self.textView.textStorage;
+    self.suppressTextViewCallbacks = YES;
+
+    // Reset all to standard highlight color
+    for (NSValue *rv in self.searchResultRanges) {
+        NSRange r = rv.rangeValue;
+        if (r.location + r.length <= storage.length) {
+            [storage addAttribute:NSBackgroundColorAttributeName
+                            value:[NSColor colorWithCalibratedRed:0.9 green:0.7 blue:0.2 alpha:0.4]
+                            range:r];
+        }
+    }
+
+    // Highlight current with brighter color
+    if (range.location + range.length <= storage.length) {
+        [storage addAttribute:NSBackgroundColorAttributeName
+                        value:[NSColor colorWithCalibratedRed:1.0 green:0.8 blue:0.2 alpha:0.7]
+                        range:range];
+    }
+
+    self.suppressTextViewCallbacks = NO;
+
+    // Scroll to visible
+    [self.textView scrollRangeToVisible:range];
+
+    [self updateSearchResultsUI];
+}
+
+- (void)updateSearchResultsUI {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSUInteger total = self.searchResultRanges.count;
+        if (total > 0) {
+            self.resultCountLabel.stringValue = [NSString stringWithFormat:@"%ld/%lu",
+                (long)(self.currentSearchIndex + 1), (unsigned long)total];
+            self.prevResultButton.enabled = YES;
+            self.nextResultButton.enabled = YES;
+            self.deleteResultsButton.enabled = YES;
+        } else {
+            self.resultCountLabel.stringValue = @"";
+            self.prevResultButton.enabled = NO;
+            self.nextResultButton.enabled = NO;
+            self.deleteResultsButton.enabled = (self.currentSearchQuery.length > 0 ||
+                                                ![self.currentFilter isEqualToString:@"all"]);
+        }
+    });
+}
+
+- (NSDictionary *)searchTranscript:(NSString *)query {
+    if (!query || query.length == 0) {
+        return @{@"error": @"Query cannot be empty"};
+    }
+
+    NSMutableArray *results = [NSMutableArray array];
+
+    // Check for special keywords
+    if ([[query lowercaseString] isEqualToString:@"pauses"] ||
+        [[query lowercaseString] isEqualToString:@"silences"]) {
+        for (FCPTranscriptSilence *silence in self.mutableSilences) {
+            [results addObject:@{
+                @"type": @"silence",
+                @"startTime": @(silence.startTime),
+                @"endTime": @(silence.endTime),
+                @"duration": @(silence.duration),
+                @"afterWordIndex": @(silence.afterWordIndex)
+            }];
+        }
+        return @{@"query": query, @"resultCount": @(results.count), @"results": results};
+    }
+
+    // Text search through words
+    @synchronized (self.mutableWords) {
+        for (FCPTranscriptWord *word in self.mutableWords) {
+            if ([word.text rangeOfString:query options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [results addObject:@{
+                    @"type": @"word",
+                    @"index": @(word.wordIndex),
+                    @"text": word.text,
+                    @"startTime": @(word.startTime),
+                    @"endTime": @(word.endTime),
+                    @"confidence": @(word.confidence),
+                    @"speaker": word.speaker ?: @"Unknown"
+                }];
+            }
+        }
+    }
+
+    // Also update the UI search
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.searchField.stringValue = query;
+        self.currentSearchQuery = query;
+        [self performSearchHighlighting];
+    });
+
+    return @{@"query": query, @"resultCount": @(results.count), @"results": results};
 }
 
 #pragma mark - Speech Recognition Authorization
@@ -502,10 +1088,30 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         return;
     }
 
-    // Skip explicit authorization check/request to avoid TCC crash with ad-hoc signed apps.
-    // Instead, just try to create the recognizer. If not authorized, the recognition task
-    // will fail with an error that we handle gracefully.
-    FCPBridge_log(@"[Transcript] Proceeding with speech recognition (authorization handled by task)");
+    // Check current authorization status
+    // SFSpeechRecognizerAuthorizationStatus: 0=notDetermined, 1=denied, 2=restricted, 3=authorized
+    SEL statusSel = NSSelectorFromString(@"authorizationStatus");
+    NSInteger status = ((NSInteger (*)(Class, SEL))objc_msgSend)(SFSpeechRecognizerClass, statusSel);
+    FCPBridge_log(@"[Transcript] Speech authorization status: %ld", (long)status);
+
+    if (status == 3) { // authorized
+        completion(YES);
+        return;
+    }
+
+    if (status == 0) { // notDetermined — request it, which should trigger the system dialog
+        FCPBridge_log(@"[Transcript] Requesting speech recognition authorization...");
+        SEL reqSel = NSSelectorFromString(@"requestAuthorization:");
+        ((void (*)(Class, SEL, id))objc_msgSend)(SFSpeechRecognizerClass, reqSel,
+            ^(NSInteger newStatus) {
+                FCPBridge_log(@"[Transcript] Authorization callback: %ld", (long)newStatus);
+                completion(newStatus == 3);
+            });
+        return;
+    }
+
+    // denied or restricted — still try, on-device recognition may work without full authorization
+    FCPBridge_log(@"[Transcript] Speech auth status %ld, attempting anyway (on-device may work)", (long)status);
     completion(YES);
 }
 
@@ -520,17 +1126,27 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         [self updateStatusUI:@"Analyzing timeline..."];
         self.spinner.hidden = NO;
         [self.spinner startAnimation:nil];
+        self.progressBar.hidden = NO;
+        self.progressBar.indeterminate = YES;
+        [self.progressBar startAnimation:nil];
         self.refreshButton.enabled = NO;
+        self.deleteSilencesButton.enabled = NO;
     });
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self requestSpeechAuthorizationWithCompletion:^(BOOL authorized) {
-            if (!authorized) {
-                [self setErrorState:@"Speech recognition not authorized. Grant access in System Settings > Privacy > Speech Recognition."];
-                return;
-            }
+        if (self.engine == FCPTranscriptEngineFCPNative || self.engine == FCPTranscriptEngineWhisper) {
+            // FCP Native and Whisper don't need Apple speech authorization
             [self performTimelineTranscription];
-        }];
+        } else {
+            [self requestSpeechAuthorizationWithCompletion:^(BOOL authorized) {
+                if (!authorized) {
+                    [self openSpeechRecognitionSettings];
+                    [self setErrorState:@"Speech recognition denied. Grant access in Settings > Privacy > Speech Recognition, or use FCP Native engine."];
+                    return;
+                }
+                [self performTimelineTranscription];
+            }];
+        }
     });
 }
 
@@ -553,13 +1169,10 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
             *timelinePos += clipDuration;
 
         } else if (isCollection && clipDuration > 0) {
-            // A collection wraps media — find the inner media and use the COLLECTION's
-            // duration and clippedRange for correct trim info.
             FCPBridge_log(@"[Transcript] Collection: %@ (%.2fs) at %.2fs", className, clipDuration, *timelinePos);
 
             id innerMedia = [self findFirstMediaInContainer:item];
             if (innerMedia) {
-                // Get the collection's clippedRange to find the source-media offset
                 double collTrimStart = 0;
                 SEL crSel = NSSelectorFromString(@"clippedRange");
                 if ([item respondsToSelector:crSel]) {
@@ -588,7 +1201,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 }
 
 - (id)findFirstMediaInContainer:(id)container {
-    // Recursively find the first FFAnchoredMediaComponent inside a collection
     id subItems = nil;
     if ([container respondsToSelector:@selector(containedItems)]) {
         subItems = ((id (*)(id, SEL))objc_msgSend)(container, @selector(containedItems));
@@ -614,7 +1226,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 }
 
 - (void)addMediaClip:(id)clip duration:(double)clipDuration atTimeline:(double)timelinePos into:(NSMutableArray *)clipInfos {
-    // For standalone media clips, read trimStart from the clip's own unclippedRange
     double trimStart = 0;
     SEL unclippedSel = NSSelectorFromString(@"unclippedRange");
     if ([clip respondsToSelector:unclippedSel]) {
@@ -659,7 +1270,284 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 }
 
 - (void)performTimelineTranscription {
-    // Get timeline clips from FCP
+    if (self.engine == FCPTranscriptEngineFCPNative) {
+        [self performFCPNativeTranscription];
+    } else if (self.engine == FCPTranscriptEngineWhisper) {
+        [self performWhisperTranscription];
+    } else {
+        [self performAppleSpeechTranscription];
+    }
+}
+
+#pragma mark - FCP Native Transcription (AASpeechAnalyzer via FFTranscriptionCoordinator)
+
+- (void)performFCPNativeTranscription {
+    FCPBridge_log(@"[Transcript] Using FCP Native engine (FFTranscriptionCoordinator)");
+
+    // Gather assets from timeline clips on the main thread.
+    // FCP's own startBackgroundTranscriptionForClips: iterates clips and calls
+    // [clip assets] (an NSSet of FFAsset) then unions them all together.
+    // We replicate that exact pattern here.
+    __block NSArray *assetArray = nil;
+
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = [self getActiveTimelineModule];
+            if (!timeline) {
+                [self setErrorState:@"No active timeline. Open a project first."];
+                return;
+            }
+
+            // Detect frame rate
+            if ([timeline respondsToSelector:@selector(sequenceFrameDuration)]) {
+                FCPTranscript_CMTime fd = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
+                    timeline, @selector(sequenceFrameDuration));
+                if (fd.timescale > 0 && fd.value > 0) {
+                    self.frameRate = (double)fd.timescale / fd.value;
+                }
+            }
+
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+            if (!sequence) {
+                [self setErrorState:@"No sequence in timeline."];
+                return;
+            }
+
+            id primaryObj = nil;
+            if ([sequence respondsToSelector:@selector(primaryObject)]) {
+                primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+            }
+            if (!primaryObj) {
+                [self setErrorState:@"No primary object in sequence."];
+                return;
+            }
+
+            id items = nil;
+            if ([primaryObj respondsToSelector:@selector(containedItems)]) {
+                items = ((id (*)(id, SEL))objc_msgSend)(primaryObj, @selector(containedItems));
+            }
+            if (!items || ![items isKindOfClass:[NSArray class]]) {
+                [self setErrorState:@"No items on timeline."];
+                return;
+            }
+
+            // modalTranscriptsForClips expects objects that respond to `assets`
+            // (like FFAnchoredObject subclasses). It internally calls [clip assets]
+            // to get FFAsset objects. We pass the containedItems directly.
+            // Also include the sequence itself as a fallback.
+            NSMutableArray *clipObjects = [NSMutableArray array];
+            SEL assetsSel = NSSelectorFromString(@"assets");
+
+            for (id item in (NSArray *)items) {
+                if ([item respondsToSelector:assetsSel]) {
+                    id itemAssets = ((id (*)(id, SEL))objc_msgSend)(item, assetsSel);
+                    if ([itemAssets isKindOfClass:[NSSet class]] && [(NSSet *)itemAssets count] > 0) {
+                        [clipObjects addObject:item];
+                        FCPBridge_log(@"[Transcript] Item %@ has %lu assets",
+                            NSStringFromClass([item class]), (unsigned long)[(NSSet *)itemAssets count]);
+                    }
+                }
+            }
+
+            // If no items had assets, try the sequence itself
+            if (clipObjects.count == 0 && [sequence respondsToSelector:assetsSel]) {
+                [clipObjects addObject:sequence];
+                FCPBridge_log(@"[Transcript] Using sequence as clip source");
+            }
+
+            assetArray = clipObjects;
+            FCPBridge_log(@"[Transcript] Collected %lu clip objects for transcription",
+                (unsigned long)assetArray.count);
+
+        } @catch (NSException *e) {
+            [self setErrorState:[NSString stringWithFormat:@"Error reading timeline: %@", e.reason]];
+        }
+    });
+
+    if (!assetArray || assetArray.count == 0) {
+        if (self.status != FCPTranscriptStatusError) {
+            [self setErrorState:@"No assets found on timeline. Try Apple Speech engine instead."];
+        }
+        return;
+    }
+
+    FCPBridge_log(@"[Transcript] Found %lu assets for FCP native transcription", (unsigned long)assetArray.count);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateStatusUI:[NSString stringWithFormat:@"Transcribing %lu asset(s) via FCP engine...",
+            (unsigned long)assetArray.count]];
+        self.progressBar.hidden = NO;
+        self.progressBar.indeterminate = YES;
+        [self.progressBar startAnimation:nil];
+    });
+
+    [self.mutableWords removeAllObjects];
+    [self.mutableSilences removeAllObjects];
+
+    // Call FFTranscriptionCoordinator.modalTranscriptsForClips:locale:
+    // This must run off the main thread (the decompiled code asserts this)
+    @try {
+        Class coordClass = objc_getClass("FFTranscriptionCoordinator");
+        if (!coordClass) {
+            [self setErrorState:@"FFTranscriptionCoordinator not found. FCP Native engine unavailable."];
+            return;
+        }
+
+        // Check if platform supports transcription
+        BOOL supported = ((BOOL (*)(id, SEL))objc_msgSend)(coordClass,
+            NSSelectorFromString(@"platformSupportsTranscription"));
+        if (!supported) {
+            [self setErrorState:@"Transcription not supported on this platform. Try Apple Speech engine."];
+            return;
+        }
+
+        id coordinator = ((id (*)(id, SEL))objc_msgSend)(coordClass,
+            NSSelectorFromString(@"sharedCoordinator"));
+        if (!coordinator) {
+            [self setErrorState:@"Could not get FFTranscriptionCoordinator. Try Apple Speech engine."];
+            return;
+        }
+
+        // Get the system language or default to en-US
+        NSString *locale = [[NSLocale currentLocale] languageCode] ?: @"en";
+        NSString *localeID = [[NSLocale currentLocale] localeIdentifier] ?: @"en-US";
+
+        FCPBridge_log(@"[Transcript] Calling modalTranscriptsForClips with %lu assets, locale=%@",
+                      (unsigned long)assetArray.count, localeID);
+
+        // modalTranscriptsForClips:locale: — synchronous, must be called off main thread
+        // It internally calls [clip assets] on each item, so we pass the assets array
+        SEL modalSel = NSSelectorFromString(@"modalTranscriptsForClips:locale:");
+        id resultMap = ((id (*)(id, SEL, id, id))objc_msgSend)(coordinator, modalSel, assetArray, localeID);
+
+        if (!resultMap) {
+            [self setErrorState:@"FCP transcription returned no results. Try Apple Speech engine."];
+            return;
+        }
+
+        FCPBridge_log(@"[Transcript] FCP transcription complete, processing results...");
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatusUI:@"Processing transcript..."];
+            self.progressBar.indeterminate = NO;
+            self.progressBar.doubleValue = 0.5;
+        });
+
+        // Extract words from the FFTranscript objects in the result map
+        // resultMap is an NSMapTable: FFAsset -> FFTranscript
+        NSUInteger totalWords = 0;
+
+        @try {
+            // NSMapTable enumeration
+            id keyEnumerator = ((id (*)(id, SEL))objc_msgSend)(resultMap,
+                NSSelectorFromString(@"keyEnumerator"));
+
+            id asset;
+            while ((asset = ((id (*)(id, SEL))objc_msgSend)(keyEnumerator, @selector(nextObject)))) {
+                id transcript = ((id (*)(id, SEL, id))objc_msgSend)(resultMap,
+                    NSSelectorFromString(@"objectForKey:"), asset);
+                if (!transcript) continue;
+
+                // Get phrases from transcript
+                id phrases = ((id (*)(id, SEL))objc_msgSend)(transcript,
+                    NSSelectorFromString(@"phrases"));
+                if (!phrases || ![phrases isKindOfClass:[NSArray class]]) continue;
+
+                for (id phrase in (NSArray *)phrases) {
+                    // Get words from phrase
+                    id phraseWords = ((id (*)(id, SEL))objc_msgSend)(phrase,
+                        NSSelectorFromString(@"words"));
+                    if (!phraseWords || ![phraseWords isKindOfClass:[NSArray class]]) continue;
+
+                    for (id fcpWord in (NSArray *)phraseWords) {
+                        NSString *text = ((id (*)(id, SEL))objc_msgSend)(fcpWord,
+                            NSSelectorFromString(@"text"));
+                        if (!text || text.length == 0) continue;
+
+                        // Get timeRange (CMTimeRange struct)
+                        SEL trSel = NSSelectorFromString(@"timeRange");
+                        NSMethodSignature *sig = [fcpWord methodSignatureForSelector:trSel];
+                        if (!sig || [sig methodReturnLength] != sizeof(FCPTranscript_CMTimeRange)) continue;
+
+                        FCPTranscript_CMTimeRange timeRange;
+                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                        [inv setTarget:fcpWord];
+                        [inv setSelector:trSel];
+                        [inv invoke];
+                        [inv getReturnValue:&timeRange];
+
+                        double startTime = CMTimeToSeconds(timeRange.start);
+                        double duration = CMTimeToSeconds(timeRange.duration);
+
+                        if (duration <= 0) continue;
+
+                        FCPTranscriptWord *word = [[FCPTranscriptWord alloc] init];
+                        word.text = text;
+                        word.startTime = startTime;
+                        word.duration = duration;
+                        word.confidence = 1.0; // FCP native doesn't provide per-word confidence
+                        word.speaker = @"Unknown";
+                        word.sourceMediaTime = startTime; // FCP native times are source-relative
+
+                        @synchronized (self.mutableWords) {
+                            [self.mutableWords addObject:word];
+                        }
+                        totalWords++;
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            FCPBridge_log(@"[Transcript] Exception extracting results: %@", e.reason);
+        }
+
+        FCPBridge_log(@"[Transcript] Extracted %lu words from FCP native transcription", (unsigned long)totalWords);
+
+        // Finalize on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @synchronized (self.mutableWords) {
+                [self.mutableWords sortUsingComparator:^NSComparisonResult(FCPTranscriptWord *a, FCPTranscriptWord *b) {
+                    if (a.startTime < b.startTime) return NSOrderedAscending;
+                    if (a.startTime > b.startTime) return NSOrderedDescending;
+                    return NSOrderedSame;
+                }];
+
+                for (NSUInteger i = 0; i < self.mutableWords.count; i++) {
+                    self.mutableWords[i].wordIndex = i;
+                }
+            }
+
+            [self detectSilences];
+            [self assignSpeakers];
+
+            self.status = FCPTranscriptStatusReady;
+            [self rebuildTextView];
+            [self startPlayheadTimer];
+
+            self.spinner.hidden = YES;
+            [self.spinner stopAnimation:nil];
+            self.progressBar.hidden = YES;
+            self.refreshButton.enabled = YES;
+            self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+
+            NSUInteger silenceCount = self.mutableSilences.count;
+            [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses (FCP Native)",
+                (unsigned long)self.mutableWords.count, (unsigned long)silenceCount]];
+
+            FCPBridge_log(@"[Transcript] FCP Native complete: %lu words, %lu silences",
+                          (unsigned long)self.mutableWords.count, (unsigned long)silenceCount);
+        });
+
+    } @catch (NSException *e) {
+        [self setErrorState:[NSString stringWithFormat:@"FCP Native error: %@. Try Apple Speech engine.", e.reason]];
+    }
+}
+
+#pragma mark - Apple Speech Transcription (SFSpeechRecognizer fallback)
+
+- (void)performAppleSpeechTranscription {
+    FCPBridge_log(@"[Transcript] Using Apple Speech engine (SFSpeechRecognizer)");
+    FCPTranscript_loadSpeechFramework();
+
     __block NSArray *clips = nil;
     __block double totalDuration = 0;
 
@@ -671,13 +1559,21 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                 return;
             }
 
+            // Detect frame rate
+            if ([timeline respondsToSelector:@selector(sequenceFrameDuration)]) {
+                FCPTranscript_CMTime fd = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
+                    timeline, @selector(sequenceFrameDuration));
+                if (fd.timescale > 0 && fd.value > 0) {
+                    self.frameRate = (double)fd.timescale / fd.value;
+                }
+            }
+
             id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
             if (!sequence) {
                 [self setErrorState:@"No sequence in timeline."];
                 return;
             }
 
-            // Get primaryObject (spine) -> containedItems
             id primaryObj = nil;
             if ([sequence respondsToSelector:@selector(primaryObject)]) {
                 primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
@@ -699,7 +1595,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
             NSMutableArray *clipInfos = [NSMutableArray array];
             double timelinePos = 0;
 
-            // Collect media clips, recursing into collections/compound clips
             [self collectClipsFrom:(NSArray *)items
                        atTimeline:&timelinePos
                              into:clipInfos];
@@ -721,16 +1616,11 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
     FCPBridge_log(@"[Transcript] Found %lu clips, total duration: %.2fs", (unsigned long)clips.count, totalDuration);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self updateStatusUI:[NSString stringWithFormat:@"Transcribing %lu clip(s)...", (unsigned long)clips.count]];
-    });
-
-    // Transcribe each clip
     [self.mutableWords removeAllObjects];
+    [self.mutableSilences removeAllObjects];
     self.completedTranscriptions = 0;
     self.totalTranscriptions = 0;
 
-    // Count clips that have media URLs
     NSMutableArray *transcribableClips = [NSMutableArray array];
     for (NSDictionary *clipInfo in clips) {
         if (clipInfo[@"mediaURL"]) {
@@ -745,11 +1635,16 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
     self.totalTranscriptions = transcribableClips.count;
 
-    // Transcribe clips one at a time (serialized) to avoid Speech framework conflicts
-    // when multiple clips reference the same source file
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateStatusUI:[NSString stringWithFormat:@"Transcribing clip 1/%lu...",
+            (unsigned long)self.totalTranscriptions]];
+        self.progressBar.hidden = NO;
+        self.progressBar.indeterminate = NO;
+        self.progressBar.doubleValue = 0;
+    });
+
     [self transcribeClipsSequentially:transcribableClips index:0 completion:^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Sort words by timeline start time
             @synchronized (self.mutableWords) {
                 [self.mutableWords sortUsingComparator:^NSComparisonResult(FCPTranscriptWord *a, FCPTranscriptWord *b) {
                     if (a.startTime < b.startTime) return NSOrderedAscending;
@@ -757,11 +1652,14 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                     return NSOrderedSame;
                 }];
 
-                // Reassign indices
                 for (NSUInteger i = 0; i < self.mutableWords.count; i++) {
                     self.mutableWords[i].wordIndex = i;
                 }
             }
+
+            // Detect silences and assign speakers
+            [self detectSilences];
+            [self assignSpeakers];
 
             self.status = FCPTranscriptStatusReady;
             [self rebuildTextView];
@@ -769,11 +1667,16 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
             self.spinner.hidden = YES;
             [self.spinner stopAnimation:nil];
+            self.progressBar.hidden = YES;
             self.refreshButton.enabled = YES;
-            [self updateStatusUI:[NSString stringWithFormat:@"%lu words transcribed",
-                (unsigned long)self.mutableWords.count]];
+            self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
 
-            FCPBridge_log(@"[Transcript] Complete: %lu total words", (unsigned long)self.mutableWords.count);
+            NSUInteger silenceCount = self.mutableSilences.count;
+            [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses",
+                (unsigned long)self.mutableWords.count, (unsigned long)silenceCount]];
+
+            FCPBridge_log(@"[Transcript] Complete: %lu words, %lu silences",
+                          (unsigned long)self.mutableWords.count, (unsigned long)silenceCount);
         });
     }];
 }
@@ -809,32 +1712,439 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         self.completedTranscriptions++;
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self updateStatusUI:[NSString stringWithFormat:@"Transcribing... (%lu/%lu clips)",
-                (unsigned long)self.completedTranscriptions, (unsigned long)self.totalTranscriptions]];
+            double progress = (double)self.completedTranscriptions / MAX(self.totalTranscriptions, 1);
+            self.progressBar.doubleValue = progress;
+
+            if (self.completedTranscriptions < self.totalTranscriptions) {
+                [self updateStatusUI:[NSString stringWithFormat:@"Transcribing clip %lu/%lu (%lu words so far)...",
+                    (unsigned long)(self.completedTranscriptions + 1),
+                    (unsigned long)self.totalTranscriptions,
+                    (unsigned long)self.mutableWords.count]];
+            } else {
+                [self updateStatusUI:[NSString stringWithFormat:@"Processing %lu words...",
+                    (unsigned long)self.mutableWords.count]];
+            }
         });
 
-        // Continue to next clip
         [self transcribeClipsSequentially:clips index:idx + 1 completion:completion];
     }];
+}
+
+#pragma mark - Parakeet Transcription (NVIDIA Parakeet TDT via CLI tool)
+
+- (NSString *)whisperTranscriberPath {
+    // Look in build directory first, then in the swift package build
+    NSString *buildDir = [[[NSBundle mainBundle] bundlePath]
+        stringByAppendingPathComponent:@"Contents/Frameworks/FCPBridge.framework/Versions/A/Resources"];
+    NSString *builtPath = [buildDir stringByAppendingPathComponent:@"whisper-transcriber"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:builtPath]) return builtPath;
+
+    // Check the FCPBridge source tree build output
+    NSString *srcPath = @"/Users/briantate/Documents/GitHub/FCPBridge/tools/whisper-transcriber/.build/release/whisper-transcriber";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:srcPath]) return srcPath;
+
+    return nil;
+}
+
+- (BOOL)buildWhisperTranscriberWithStatus:(void(^)(NSString *status))statusUpdate {
+    NSString *projectDir = @"/Users/briantate/Documents/GitHub/FCPBridge/tools/whisper-transcriber";
+    if (![[NSFileManager defaultManager] fileExistsAtPath:projectDir]) {
+        FCPBridge_log(@"[Transcript] Whisper transcriber project not found at %@", projectDir);
+        return NO;
+    }
+
+    statusUpdate(@"Building Parakeet transcriber (first time only)...");
+    FCPBridge_log(@"[Transcript] Building Parakeet transcriber...");
+
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/usr/bin/swift";
+    task.arguments = @[@"build", @"-c", @"release"];
+    task.currentDirectoryPath = projectDir;
+
+    NSPipe *outputPipe = [NSPipe pipe];
+    task.standardOutput = outputPipe;
+    task.standardError = outputPipe;
+
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *e) {
+        FCPBridge_log(@"[Transcript] Failed to launch swift build: %@", e.reason);
+        return NO;
+    }
+
+    NSData *outputData = [outputPipe.fileHandleForReading readDataToEndOfFile];
+    NSString *output = [[NSString alloc] initWithData:outputData encoding:NSUTF8StringEncoding];
+
+    if (task.terminationStatus != 0) {
+        FCPBridge_log(@"[Transcript] Whisper build failed (status %d): %@", task.terminationStatus, output);
+        return NO;
+    }
+
+    FCPBridge_log(@"[Transcript] Whisper transcriber built successfully");
+    return YES;
+}
+
+- (void)performWhisperTranscription {
+    FCPBridge_log(@"[Transcript] Using Parakeet engine (FluidAudio)");
+
+    // Check / build the CLI tool
+    NSString *binaryPath = [self whisperTranscriberPath];
+    if (!binaryPath) {
+        __block BOOL buildOK = NO;
+        buildOK = [self buildWhisperTranscriberWithStatus:^(NSString *status) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self updateStatusUI:status];
+                self.progressBar.indeterminate = YES;
+            });
+        }];
+        if (!buildOK) {
+            [self setErrorState:@"Failed to build Parakeet transcriber. Check tools/whisper-transcriber/."];
+            return;
+        }
+        binaryPath = [self whisperTranscriberPath];
+        if (!binaryPath) {
+            [self setErrorState:@"Parakeet transcriber binary not found after build."];
+            return;
+        }
+    }
+
+    FCPBridge_log(@"[Transcript] Using whisper-transcriber at: %@", binaryPath);
+
+    // Collect clips from timeline (reuse existing logic)
+    __block NSArray *clips = nil;
+
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = [self getActiveTimelineModule];
+            if (!timeline) {
+                [self setErrorState:@"No active timeline. Open a project first."];
+                return;
+            }
+
+            // Detect frame rate
+            if ([timeline respondsToSelector:@selector(sequenceFrameDuration)]) {
+                FCPTranscript_CMTime fd = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
+                    timeline, @selector(sequenceFrameDuration));
+                if (fd.timescale > 0 && fd.value > 0) {
+                    self.frameRate = (double)fd.timescale / fd.value;
+                }
+            }
+
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+            if (!sequence) { [self setErrorState:@"No sequence in timeline."]; return; }
+
+            id primaryObj = nil;
+            if ([sequence respondsToSelector:@selector(primaryObject)]) {
+                primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+            }
+            if (!primaryObj) { [self setErrorState:@"No primary object in sequence."]; return; }
+
+            id items = nil;
+            if ([primaryObj respondsToSelector:@selector(containedItems)]) {
+                items = ((id (*)(id, SEL))objc_msgSend)(primaryObj, @selector(containedItems));
+            }
+            if (!items || ![items isKindOfClass:[NSArray class]]) {
+                [self setErrorState:@"No items on timeline."]; return;
+            }
+
+            NSMutableArray *clipInfos = [NSMutableArray array];
+            double timelinePos = 0;
+            [self collectClipsFrom:(NSArray *)items atTimeline:&timelinePos into:clipInfos];
+            clips = [clipInfos copy];
+        } @catch (NSException *e) {
+            [self setErrorState:[NSString stringWithFormat:@"Error reading timeline: %@", e.reason]];
+        }
+    });
+
+    if (!clips || clips.count == 0) {
+        if (self.status != FCPTranscriptStatusError) {
+            [self setErrorState:@"No media clips found on timeline."];
+        }
+        return;
+    }
+
+    // Filter to clips with media URLs
+    NSMutableArray *transcribableClips = [NSMutableArray array];
+    for (NSDictionary *clipInfo in clips) {
+        if (clipInfo[@"mediaURL"]) {
+            [transcribableClips addObject:clipInfo];
+        }
+    }
+
+    if (transcribableClips.count == 0) {
+        [self setErrorState:@"Could not find source media files for any clips."];
+        return;
+    }
+
+    [self.mutableWords removeAllObjects];
+    [self.mutableSilences removeAllObjects];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateStatusUI:[NSString stringWithFormat:@"Transcribing %lu clips with Parakeet...",
+            (unsigned long)transcribableClips.count]];
+        self.progressBar.hidden = NO;
+        self.progressBar.indeterminate = NO;
+        self.progressBar.doubleValue = 0;
+    });
+
+    // Transcribe each clip via the CLI tool
+    NSUInteger totalClips = transcribableClips.count;
+    for (NSUInteger idx = 0; idx < totalClips; idx++) {
+        NSDictionary *clipInfo = transcribableClips[idx];
+        NSURL *mediaURL = clipInfo[@"mediaURL"];
+        double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
+        double trimStart = [clipInfo[@"trimStart"] doubleValue];
+        double clipDuration = [clipInfo[@"duration"] doubleValue];
+        NSString *clipHandle = clipInfo[@"handle"];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            double progress = (double)idx / MAX(totalClips, 1);
+            self.progressBar.doubleValue = progress;
+            [self updateStatusUI:[NSString stringWithFormat:@"Parakeet: clip %lu/%lu (%lu words)...",
+                (unsigned long)(idx + 1), (unsigned long)totalClips,
+                (unsigned long)self.mutableWords.count]];
+        });
+
+        FCPBridge_log(@"[Transcript] Parakeet transcribing: %@ (timeline:%.2f, trim:%.2f, dur:%.2f)",
+            mediaURL.lastPathComponent, timelineStart, trimStart, clipDuration);
+
+        // Build arguments
+        NSMutableArray *taskArgs = [NSMutableArray arrayWithObjects:mediaURL.path, @"--progress", nil];
+        if (self.speakerDetectionEnabled) {
+            [taskArgs addObject:@"--speakers"];
+        }
+
+        // Run the CLI tool with streaming stderr for progress
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = binaryPath;
+        task.arguments = taskArgs;
+
+        NSPipe *stdoutPipe = [NSPipe pipe];
+        NSPipe *stderrPipe = [NSPipe pipe];
+        task.standardOutput = stdoutPipe;
+        task.standardError = stderrPipe;
+
+        // Read stdout asynchronously to prevent pipe buffer deadlock
+        // (large JSON output can exceed the 64KB pipe buffer)
+        __block NSMutableData *stdoutAccum = [NSMutableData data];
+        stdoutPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+            NSData *data = handle.availableData;
+            if (data.length > 0) {
+                @synchronized (stdoutAccum) {
+                    [stdoutAccum appendData:data];
+                }
+            }
+        };
+
+        // Read stderr asynchronously for live progress updates
+        __block NSMutableData *stderrAccum = [NSMutableData data];
+        stderrPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+            NSData *data = handle.availableData;
+            if (data.length == 0) return;
+            [stderrAccum appendData:data];
+
+            NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!text) return;
+
+            // Parse PROGRESS lines: "PROGRESS:0.5:message"
+            for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                if ([line hasPrefix:@"PROGRESS:"]) {
+                    NSArray *parts = [line componentsSeparatedByString:@":"];
+                    if (parts.count >= 3) {
+                        double frac = [parts[1] doubleValue];
+                        NSString *msg = [[parts subarrayWithRange:NSMakeRange(2, parts.count - 2)]
+                            componentsJoinedByString:@":"];
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            double clipProgress = (double)idx / MAX(totalClips, 1);
+                            double subProgress = frac / MAX(totalClips, 1);
+                            self.progressBar.indeterminate = NO;
+                            self.progressBar.doubleValue = clipProgress + subProgress;
+                            [self updateStatusUI:[NSString stringWithFormat:@"Parakeet %lu/%lu: %@",
+                                (unsigned long)(idx + 1), (unsigned long)totalClips, msg]];
+                        });
+                    }
+                } else if ([line hasPrefix:@"ERROR:"]) {
+                    FCPBridge_log(@"[Transcript] Parakeet stderr: %@", line);
+                }
+            }
+        };
+
+        @try {
+            [task launch];
+            [task waitUntilExit];
+        } @catch (NSException *e) {
+            FCPBridge_log(@"[Transcript] Parakeet task failed: %@", e.reason);
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil;
+            stderrPipe.fileHandleForReading.readabilityHandler = nil;
+            continue;
+        }
+
+        // Stop handlers and drain remaining data
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil;
+        stderrPipe.fileHandleForReading.readabilityHandler = nil;
+
+        // Read any remaining buffered data
+        NSData *remaining = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
+        if (remaining.length > 0) {
+            @synchronized (stdoutAccum) {
+                [stdoutAccum appendData:remaining];
+            }
+        }
+
+        if (task.terminationStatus != 0) {
+            NSString *errStr = [[NSString alloc] initWithData:stderrAccum encoding:NSUTF8StringEncoding];
+            FCPBridge_log(@"[Transcript] Parakeet error for %@: %@", mediaURL.lastPathComponent, errStr);
+            continue;
+        }
+
+        // Parse JSON output
+        NSData *jsonData;
+        @synchronized (stdoutAccum) {
+            jsonData = [stdoutAccum copy];
+        }
+        NSArray *wordDicts = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+
+        if (![wordDicts isKindOfClass:[NSArray class]]) {
+            FCPBridge_log(@"[Transcript] Parakeet returned invalid JSON for %@", mediaURL.lastPathComponent);
+            continue;
+        }
+
+        NSUInteger wordsAdded = 0;
+        @synchronized (self.mutableWords) {
+            for (NSDictionary *wd in wordDicts) {
+                NSString *text = wd[@"word"];
+                double startTime = [wd[@"startTime"] doubleValue];
+                double endTime = [wd[@"endTime"] doubleValue];
+                double confidence = [wd[@"confidence"] doubleValue];
+                NSString *speaker = wd[@"speaker"] ?: @"Unknown";
+
+                // Apply trim and timeline offset
+                if (startTime >= trimStart && startTime < trimStart + clipDuration) {
+                    FCPTranscriptWord *word = [[FCPTranscriptWord alloc] init];
+                    word.text = text;
+                    word.startTime = timelineStart + (startTime - trimStart);
+                    word.duration = MIN(endTime - startTime, (trimStart + clipDuration) - startTime);
+                    word.confidence = confidence;
+                    word.clipHandle = clipHandle;
+                    word.clipTimelineStart = timelineStart;
+                    word.sourceMediaOffset = trimStart;
+                    word.sourceMediaTime = startTime; // raw time in source file (immutable)
+                    word.sourceMediaPath = mediaURL.path;
+                    word.speaker = speaker;
+                    [self.mutableWords addObject:word];
+                    wordsAdded++;
+                }
+            }
+        }
+
+        FCPBridge_log(@"[Transcript] Parakeet got %lu words from %@",
+            (unsigned long)wordsAdded, mediaURL.lastPathComponent);
+    }
+
+    // Finalize — sort, index, detect silences, build UI
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @synchronized (self.mutableWords) {
+            [self.mutableWords sortUsingComparator:^NSComparisonResult(FCPTranscriptWord *a, FCPTranscriptWord *b) {
+                if (a.startTime < b.startTime) return NSOrderedAscending;
+                if (a.startTime > b.startTime) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+            for (NSUInteger i = 0; i < self.mutableWords.count; i++) {
+                self.mutableWords[i].wordIndex = i;
+            }
+        }
+
+        [self detectSilences];
+        [self assignSpeakers];
+
+        self.status = FCPTranscriptStatusReady;
+        [self rebuildTextView];
+        [self startPlayheadTimer];
+
+        self.spinner.hidden = YES;
+        [self.spinner stopAnimation:nil];
+        self.progressBar.hidden = YES;
+        self.refreshButton.enabled = YES;
+        self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+
+        [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses (Parakeet)",
+            (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count]];
+
+        FCPBridge_log(@"[Transcript] Whisper transcription complete: %lu words, %lu silences",
+            (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count);
+    });
+}
+
+#pragma mark - Silence Detection
+
+- (void)detectSilences {
+    [self.mutableSilences removeAllObjects];
+
+    @synchronized (self.mutableWords) {
+        if (self.mutableWords.count < 2) return;
+
+        for (NSUInteger i = 0; i < self.mutableWords.count - 1; i++) {
+            FCPTranscriptWord *current = self.mutableWords[i];
+            FCPTranscriptWord *next = self.mutableWords[i + 1];
+
+            double gap = next.startTime - current.endTime;
+            if (gap >= self.silenceThreshold) {
+                FCPTranscriptSilence *silence = [[FCPTranscriptSilence alloc] init];
+                silence.startTime = current.endTime;
+                silence.endTime = next.startTime;
+                silence.duration = gap;
+                silence.afterWordIndex = i;
+                [self.mutableSilences addObject:silence];
+            }
+        }
+    }
+
+    FCPBridge_log(@"[Transcript] Detected %lu silences (threshold: %.2fs)",
+                  (unsigned long)self.mutableSilences.count, self.silenceThreshold);
+}
+
+#pragma mark - Speaker Assignment
+
+- (void)assignSpeakers {
+    // If speaker diarization provided real labels (macOS 26+), keep them.
+    // Otherwise label unknown words as "Unknown" (same as Premiere Pro).
+    // Users can always manually override via setSpeaker:forWordsFrom:count:.
+    @synchronized (self.mutableWords) {
+        for (FCPTranscriptWord *word in self.mutableWords) {
+            if (!word.speaker || word.speaker.length == 0) {
+                word.speaker = @"Unknown";
+            }
+        }
+    }
+}
+
+- (void)setSpeaker:(NSString *)speaker forWordsFrom:(NSUInteger)startIndex count:(NSUInteger)count {
+    @synchronized (self.mutableWords) {
+        NSUInteger end = MIN(startIndex + count, self.mutableWords.count);
+        for (NSUInteger i = startIndex; i < end; i++) {
+            self.mutableWords[i].speaker = speaker;
+        }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self rebuildTextView];
+    });
 }
 
 #pragma mark - Media URL Discovery
 
 - (NSURL *)getMediaURLForClip:(id)clip {
-    // Try multiple property chains to find the source media file URL
-    // Chain 1: clip.media.originalMediaURL (FFAsset direct method)
+    // Chain 1: clip.media.originalMediaURL
     @try {
         if ([clip respondsToSelector:NSSelectorFromString(@"media")]) {
             id media = ((id (*)(id, SEL))objc_msgSend)(clip, NSSelectorFromString(@"media"));
             if (media) {
-                // Try originalMediaURL
                 SEL omSel = NSSelectorFromString(@"originalMediaURL");
                 if ([media respondsToSelector:omSel]) {
                     id url = ((id (*)(id, SEL))objc_msgSend)(media, omSel);
                     if (url && [url isKindOfClass:[NSURL class]]) return url;
                 }
 
-                // Try originalMediaRep -> fileURLs
                 SEL omrSel = NSSelectorFromString(@"originalMediaRep");
                 if ([media respondsToSelector:omrSel]) {
                     id rep = ((id (*)(id, SEL))objc_msgSend)(media, omrSel);
@@ -847,7 +2157,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                                 if ([url isKindOfClass:[NSURL class]]) return url;
                             }
                         }
-                        // Try URL property
                         SEL urlSel = NSSelectorFromString(@"URL");
                         if ([rep respondsToSelector:urlSel]) {
                             id url = ((id (*)(id, SEL))objc_msgSend)(rep, urlSel);
@@ -856,7 +2165,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                     }
                 }
 
-                // Try currentRep -> fileURLs
                 SEL crSel = NSSelectorFromString(@"currentRep");
                 if ([media respondsToSelector:crSel]) {
                     id rep = ((id (*)(id, SEL))objc_msgSend)(media, crSel);
@@ -906,12 +2214,11 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         if ([url isKindOfClass:[NSURL class]]) return url;
     } @catch (NSException *e) {}
 
-    // Chain 5: navigate media -> iterate properties looking for NSURL
+    // Chain 5: iterate properties looking for NSURL
     @try {
         if ([clip respondsToSelector:NSSelectorFromString(@"media")]) {
             id media = ((id (*)(id, SEL))objc_msgSend)(clip, NSSelectorFromString(@"media"));
             if (media) {
-                // Get all properties and check for URL types
                 unsigned int propCount = 0;
                 Class cls = [media class];
                 while (cls && cls != [NSObject class]) {
@@ -963,7 +2270,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         return;
     }
 
-    // Verify file exists
     if (![[NSFileManager defaultManager] fileExistsAtPath:audioURL.path]) {
         FCPBridge_log(@"[Transcript] File not found: %@", audioURL.path);
         completion(nil, [NSError errorWithDomain:@"FCPTranscript" code:2
@@ -974,7 +2280,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     FCPBridge_log(@"[Transcript] Transcribing: %@ (timeline:%.2f, trim:%.2f, dur:%.2f)",
                   audioURL.lastPathComponent, timelineStart, trimStart, trimDuration);
 
-    // Create recognizer
     id recognizer = ((id (*)(id, SEL, id))objc_msgSend)(
         [SFSpeechRecognizerClass alloc],
         NSSelectorFromString(@"initWithLocale:"),
@@ -986,7 +2291,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         return;
     }
 
-    // Check availability
     BOOL isAvailable = ((BOOL (*)(id, SEL))objc_msgSend)(recognizer, NSSelectorFromString(@"isAvailable"));
     if (!isAvailable) {
         completion(nil, [NSError errorWithDomain:@"FCPTranscript" code:4
@@ -994,7 +2298,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         return;
     }
 
-    // Create request
     id request = ((id (*)(id, SEL, id))objc_msgSend)(
         [SFSpeechURLRecognitionRequestClass alloc],
         NSSelectorFromString(@"initWithURL:"),
@@ -1006,17 +2309,33 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         return;
     }
 
-    // Configure request
+    // Enable partial results so we get streaming progress for long clips
     ((void (*)(id, SEL, BOOL))objc_msgSend)(request,
-        NSSelectorFromString(@"setShouldReportPartialResults:"), NO);
+        NSSelectorFromString(@"setShouldReportPartialResults:"), YES);
 
-    // Request on-device recognition if available
+    // Use on-device recognition — faster, no network needed, and avoids stricter
+    // authorization requirements that can prevent the app from appearing in Settings
     SEL onDeviceSel = NSSelectorFromString(@"setRequiresOnDeviceRecognition:");
     if ([request respondsToSelector:onDeviceSel]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(request, onDeviceSel, NO); // Allow server for better quality
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(request, onDeviceSel, YES);
     }
 
-    // Start recognition
+    // macOS 26+: Enable speaker diarization if user opted in
+    __block BOOL useSpeakerDiarization = NO;
+    if (self.speakerDetectionEnabled && FCPTranscript_isSpeakerDiarizationAvailable()) {
+        SEL speakerSel = NSSelectorFromString(@"setAddsSpeakerAttribution:");
+        if ([request respondsToSelector:speakerSel]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(request, speakerSel, YES);
+            useSpeakerDiarization = YES;
+            FCPBridge_log(@"[Transcript] Speaker diarization enabled (macOS 26+)");
+        } else {
+            FCPBridge_log(@"[Transcript] Speaker diarization selector not available on this request");
+        }
+    }
+
+    // Track last partial word count for progress updates
+    __block NSUInteger lastPartialCount = 0;
+
     SEL taskSel = NSSelectorFromString(@"recognitionTaskWithRequest:resultHandler:");
     ((id (*)(id, SEL, id, id))objc_msgSend)(recognizer, taskSel, request,
         ^(id result, NSError *error) {
@@ -1025,27 +2344,52 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                 return;
             }
 
-            // Check if final
             BOOL isFinal = ((BOOL (*)(id, SEL))objc_msgSend)(result, NSSelectorFromString(@"isFinal"));
-            if (!isFinal) return;
 
-            // Get best transcription
             id transcription = ((id (*)(id, SEL))objc_msgSend)(result,
                 NSSelectorFromString(@"bestTranscription"));
             if (!transcription) {
-                completion(@[], nil);
+                if (isFinal) completion(@[], nil);
                 return;
             }
 
-            // Get segments (word-level)
             id segments = ((id (*)(id, SEL))objc_msgSend)(transcription,
                 NSSelectorFromString(@"segments"));
             if (!segments || ![segments isKindOfClass:[NSArray class]]) {
-                completion(@[], nil);
+                if (isFinal) completion(@[], nil);
                 return;
             }
 
+            NSUInteger segCount = [(NSArray *)segments count];
+
+            // Update progress on partial results (throttled to every 10 new words)
+            if (!isFinal) {
+                if (segCount > lastPartialCount + 10) {
+                    lastPartialCount = segCount;
+                    // Estimate progress based on latest word timestamp vs clip duration
+                    double latestTime = 0;
+                    if (segCount > 0) {
+                        id lastSeg = [(NSArray *)segments lastObject];
+                        latestTime = ((double (*)(id, SEL))objc_msgSend)(lastSeg,
+                            NSSelectorFromString(@"timestamp"));
+                    }
+                    double progressFraction = (trimDuration > 0) ? (latestTime - trimStart) / trimDuration : 0;
+                    progressFraction = MIN(MAX(progressFraction, 0), 0.99);
+
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.progressBar.indeterminate = NO;
+                        self.progressBar.doubleValue = progressFraction;
+                        [self updateStatusUI:[NSString stringWithFormat:@"Transcribing... %lu words (%.0f%%)",
+                            (unsigned long)segCount, progressFraction * 100]];
+                    });
+                }
+                return; // Wait for final result
+            }
+
+            // Final result — extract all words
             NSMutableArray<FCPTranscriptWord *> *words = [NSMutableArray array];
+            NSMutableSet *speakerNames = [NSMutableSet set];
+
             for (id segment in (NSArray *)segments) {
                 NSString *text = ((id (*)(id, SEL))objc_msgSend)(segment,
                     NSSelectorFromString(@"substring"));
@@ -1056,23 +2400,74 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                 float confidence = ((float (*)(id, SEL))objc_msgSend)(segment,
                     NSSelectorFromString(@"confidence"));
 
-                // Filter to only words within the clip's trim range
-                double wordEndInSource = timestamp + duration;
+                // macOS 26+: Extract speaker label from segment
+                NSString *speakerLabel = @"Unknown";
+                if (useSpeakerDiarization) {
+                    // Try speakerAttribution property (SFSpeakerAttribution object)
+                    SEL attrSel = NSSelectorFromString(@"speakerAttribution");
+                    if ([segment respondsToSelector:attrSel]) {
+                        id attribution = ((id (*)(id, SEL))objc_msgSend)(segment, attrSel);
+                        if (attribution) {
+                            // SFSpeakerAttribution has a 'speaker' property (SFSpeaker)
+                            SEL speakerSel = NSSelectorFromString(@"speaker");
+                            if ([attribution respondsToSelector:speakerSel]) {
+                                id speaker = ((id (*)(id, SEL))objc_msgSend)(attribution, speakerSel);
+                                if (speaker) {
+                                    // SFSpeaker has identifier/name
+                                    SEL nameSel = NSSelectorFromString(@"identifier");
+                                    if ([speaker respondsToSelector:nameSel]) {
+                                        NSString *name = ((id (*)(id, SEL))objc_msgSend)(speaker, nameSel);
+                                        if (name.length > 0) {
+                                            speakerLabel = [NSString stringWithFormat:@"Speaker %@", name];
+                                        }
+                                    }
+                                    if ([speakerLabel isEqualToString:@"Unknown"]) {
+                                        // Fallback: try description or displayName
+                                        SEL dispSel = NSSelectorFromString(@"displayName");
+                                        if ([speaker respondsToSelector:dispSel]) {
+                                            NSString *dn = ((id (*)(id, SEL))objc_msgSend)(speaker, dispSel);
+                                            if (dn.length > 0) speakerLabel = dn;
+                                        }
+                                    }
+                                }
+                            }
+                            // Fallback: attribution might directly have speakerIdentifier
+                            if ([speakerLabel isEqualToString:@"Unknown"]) {
+                                SEL idSel = NSSelectorFromString(@"speakerIdentifier");
+                                if ([attribution respondsToSelector:idSel]) {
+                                    NSString *sid = ((id (*)(id, SEL))objc_msgSend)(attribution, idSel);
+                                    if (sid.length > 0) {
+                                        speakerLabel = [NSString stringWithFormat:@"Speaker %@", sid];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    [speakerNames addObject:speakerLabel];
+                }
+
                 if (timestamp >= trimStart && timestamp < trimStart + trimDuration) {
                     FCPTranscriptWord *word = [[FCPTranscriptWord alloc] init];
                     word.text = text;
-                    // Map source time to timeline time
                     word.startTime = timelineStart + (timestamp - trimStart);
                     word.duration = MIN(duration, (trimStart + trimDuration) - timestamp);
                     word.confidence = confidence;
                     word.clipHandle = clipHandle;
                     word.clipTimelineStart = timelineStart;
                     word.sourceMediaOffset = trimStart;
+                    word.sourceMediaTime = timestamp; // raw time in source file (immutable)
+                    word.sourceMediaPath = audioURL.path;
+                    word.speaker = speakerLabel;
                     [words addObject:word];
                 }
             }
 
-            FCPBridge_log(@"[Transcript] Got %lu words from segments", (unsigned long)words.count);
+            if (useSpeakerDiarization) {
+                FCPBridge_log(@"[Transcript] Got %lu words with %lu unique speakers from segments",
+                    (unsigned long)words.count, (unsigned long)speakerNames.count);
+            } else {
+                FCPBridge_log(@"[Transcript] Got %lu words from segments", (unsigned long)words.count);
+            }
             completion(words, nil);
         });
 }
@@ -1094,21 +2489,27 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         [self updateStatusUI:@"Transcribing audio file..."];
         self.spinner.hidden = NO;
         [self.spinner startAnimation:nil];
+        self.progressBar.hidden = NO;
+        self.progressBar.indeterminate = YES;
+        [self.progressBar startAnimation:nil];
         self.refreshButton.enabled = NO;
+        self.deleteSilencesButton.enabled = NO;
     });
 
     [self requestSpeechAuthorizationWithCompletion:^(BOOL authorized) {
         if (!authorized) {
-            [self setErrorState:@"Speech recognition not authorized."];
+            [self openSpeechRecognitionSettings];
+            [self setErrorState:@"Speech recognition not authorized. Opening System Settings..."];
             return;
         }
 
         [self.mutableWords removeAllObjects];
+        [self.mutableSilences removeAllObjects];
 
         [self transcribeAudioFile:audioURL
                     timelineStart:timelineStart
                         trimStart:trimStart
-                     trimDuration:(trimDuration == HUGE_VAL ? 7200.0 : trimDuration) // 2hr max
+                     trimDuration:(trimDuration == HUGE_VAL ? 7200.0 : trimDuration)
                        clipHandle:nil
                        completion:^(NSArray<FCPTranscriptWord *> *words, NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1122,15 +2523,23 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                             self.mutableWords[i].wordIndex = i;
                         }
                     }
+
+                    [self detectSilences];
+                    [self assignSpeakers];
+
                     self.status = FCPTranscriptStatusReady;
                     [self rebuildTextView];
                     [self startPlayheadTimer];
-                    [self updateStatusUI:[NSString stringWithFormat:@"%lu words transcribed",
-                        (unsigned long)self.mutableWords.count]];
+                    self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+
+                    NSUInteger silenceCount = self.mutableSilences.count;
+                    [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses",
+                        (unsigned long)self.mutableWords.count, (unsigned long)silenceCount]];
                 }
 
                 self.spinner.hidden = YES;
                 [self.spinner stopAnimation:nil];
+                self.progressBar.hidden = YES;
                 self.refreshButton.enabled = YES;
             });
         }];
@@ -1141,59 +2550,205 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
 - (void)rebuildTextView {
     self.suppressTextViewCallbacks = YES;
+    self.lastPlayheadHighlightRange = NSMakeRange(NSNotFound, 0);
 
     NSMutableAttributedString *attrStr = [[NSMutableAttributedString alloc] init];
     NSUInteger textPos = 0;
 
+    // Color definitions
+    NSColor *normalColor = [NSColor colorWithCalibratedWhite:0.9 alpha:1.0];
+    NSColor *lowConfColor = [NSColor systemOrangeColor];
+    NSColor *headerSpeakerColor = [NSColor colorWithCalibratedRed:0.6 green:0.75 blue:1.0 alpha:1.0];
+    NSColor *headerTimeColor = [NSColor colorWithCalibratedWhite:0.5 alpha:1.0];
+    NSColor *silenceBgColor = [NSColor colorWithCalibratedRed:0.82 green:0.62 blue:0.17 alpha:1.0];
+    NSColor *silenceFgColor = [NSColor colorWithCalibratedWhite:0.1 alpha:1.0];
+
+    NSFont *normalFont = [NSFont systemFontOfSize:15];
+    NSFont *headerSpeakerFont = [NSFont boldSystemFontOfSize:13];
+    NSFont *headerTimeFont = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+    NSFont *silenceFont = [NSFont boldSystemFontOfSize:13];
+
     NSDictionary *normalAttrs = @{
-        NSFontAttributeName: [NSFont systemFontOfSize:16],
-        NSForegroundColorAttributeName: [NSColor labelColor],
+        NSFontAttributeName: normalFont,
+        NSForegroundColorAttributeName: normalColor,
         NSCursorAttributeName: [NSCursor pointingHandCursor],
+        FCPAttrItemType: @"word",
     };
 
     NSDictionary *lowConfAttrs = @{
-        NSFontAttributeName: [NSFont systemFontOfSize:16],
-        NSForegroundColorAttributeName: [NSColor systemOrangeColor],
+        NSFontAttributeName: normalFont,
+        NSForegroundColorAttributeName: lowConfColor,
         NSCursorAttributeName: [NSCursor pointingHandCursor],
+        FCPAttrItemType: @"word",
     };
 
+    // Build silence lookup: afterWordIndex -> silence
+    NSMutableDictionary<NSNumber *, FCPTranscriptSilence *> *silenceMap = [NSMutableDictionary dictionary];
+    for (FCPTranscriptSilence *s in self.mutableSilences) {
+        silenceMap[@(s.afterWordIndex)] = s;
+    }
+
     @synchronized (self.mutableWords) {
+        if (self.mutableWords.count == 0) {
+            self.suppressTextViewCallbacks = NO;
+            return;
+        }
+
+        // Compute segments: group by speaker + large time gaps
+        NSMutableArray *segments = [NSMutableArray array];
+        NSMutableDictionary *currentSegment = nil;
+        NSString *currentSpeaker = nil;
+
         for (NSUInteger i = 0; i < self.mutableWords.count; i++) {
             FCPTranscriptWord *word = self.mutableWords[i];
+            BOOL newSegment = NO;
 
-            // Choose attributes based on confidence
-            NSDictionary *attrs = (word.confidence < 0.5) ? lowConfAttrs : normalAttrs;
-
-            // Add space before word (except first)
-            if (i > 0) {
-                // Check if this is a new sentence (prev word ended with punctuation or big time gap)
+            if (i == 0) {
+                newSegment = YES;
+            } else {
                 FCPTranscriptWord *prev = self.mutableWords[i - 1];
                 double gap = word.startTime - prev.endTime;
+                // New segment on sentence-level pauses (>1s) or speaker change.
+                // 1 second is a natural sentence/thought boundary that creates
+                // readable paragraph-sized chunks matching Premiere's layout.
+                if (gap > 1.0 || ![word.speaker isEqualToString:currentSpeaker]) {
+                    newSegment = YES;
+                }
+            }
 
-                if (gap > 2.0) {
-                    // Paragraph break for large gaps (>2s)
-                    [attrStr appendAttributedString:[[NSAttributedString alloc]
-                        initWithString:@"\n\n" attributes:normalAttrs]];
-                    textPos += 2;
-                } else {
+            if (newSegment) {
+                currentSegment = [NSMutableDictionary dictionaryWithDictionary:@{
+                    @"speaker": word.speaker ?: @"Unknown",
+                    @"startWordIndex": @(i),
+                    @"startTime": @(word.startTime),
+                }];
+                [segments addObject:currentSegment];
+                currentSpeaker = word.speaker;
+            }
+
+            currentSegment[@"endWordIndex"] = @(i);
+            currentSegment[@"endTime"] = @(word.endTime);
+        }
+
+        // Build the attributed string segment by segment
+        for (NSDictionary *segment in segments) {
+            NSUInteger segStart = [segment[@"startWordIndex"] unsignedIntegerValue];
+            NSUInteger segEnd = [segment[@"endWordIndex"] unsignedIntegerValue];
+            NSString *speaker = segment[@"speaker"];
+            double segStartTime = [segment[@"startTime"] doubleValue];
+            double segEndTime = [segment[@"endTime"] doubleValue];
+
+            // Add spacing before segment (except first)
+            if (segStart > 0) {
+                [attrStr appendAttributedString:[[NSAttributedString alloc]
+                    initWithString:@"\n\n" attributes:@{
+                        NSFontAttributeName: [NSFont systemFontOfSize:8],
+                        FCPAttrItemType: @"spacer",
+                    }]];
+                textPos += 2;
+            }
+
+            // ── Segment Header: "Speaker 1        00:00:00:00 - 00:00:15:19" ──
+            NSString *startTC = FCPTranscript_timecodeFromSeconds(segStartTime, self.frameRate);
+            NSString *endTC = FCPTranscript_timecodeFromSeconds(segEndTime, self.frameRate);
+
+            // Speaker name (clickable to rename)
+            NSString *speakerStr = [NSString stringWithFormat:@"%@", speaker];
+            [attrStr appendAttributedString:[[NSAttributedString alloc]
+                initWithString:speakerStr attributes:@{
+                    NSFontAttributeName: headerSpeakerFont,
+                    NSForegroundColorAttributeName: headerSpeakerColor,
+                    NSUnderlineStyleAttributeName: @(NSUnderlineStyleSingle),
+                    NSCursorAttributeName: [NSCursor pointingHandCursor],
+                    FCPAttrItemType: @"speakerLabel",
+                    FCPAttrSpeakerName: speaker,
+                    FCPAttrSegmentStartIndex: @(segStart),
+                    FCPAttrSegmentEndIndex: @(segEnd),
+                }]];
+            textPos += speakerStr.length;
+
+            // Spacer between speaker and timecode
+            NSString *spacer = @"        ";
+            [attrStr appendAttributedString:[[NSAttributedString alloc]
+                initWithString:spacer attributes:@{
+                    NSFontAttributeName: headerTimeFont,
+                    FCPAttrItemType: @"header",
+                }]];
+            textPos += spacer.length;
+
+            // Timecode range
+            NSString *timeStr = [NSString stringWithFormat:@"%@ - %@", startTC, endTC];
+            [attrStr appendAttributedString:[[NSAttributedString alloc]
+                initWithString:timeStr attributes:@{
+                    NSFontAttributeName: headerTimeFont,
+                    NSForegroundColorAttributeName: headerTimeColor,
+                    FCPAttrItemType: @"header",
+                }]];
+            textPos += timeStr.length;
+
+            // Newline after header
+            [attrStr appendAttributedString:[[NSAttributedString alloc]
+                initWithString:@"\n" attributes:@{
+                    NSFontAttributeName: normalFont,
+                    FCPAttrItemType: @"header",
+                }]];
+            textPos += 1;
+
+            // ── Words in this segment ──
+            for (NSUInteger i = segStart; i <= segEnd; i++) {
+                FCPTranscriptWord *word = self.mutableWords[i];
+
+                // Check for silence before this word
+                if (i > 0) {
+                    FCPTranscriptSilence *silence = silenceMap[@(i - 1)];
+                    if (silence) {
+                        // Insert silence marker: " [···] "
+                        NSString *silenceStr = @" [\u22EF] ";
+
+                        NSMutableDictionary *silenceAttrs = [NSMutableDictionary dictionaryWithDictionary:@{
+                            NSFontAttributeName: silenceFont,
+                            NSForegroundColorAttributeName: silenceFgColor,
+                            NSBackgroundColorAttributeName: silenceBgColor,
+                            FCPAttrItemType: @"silence",
+                            FCPAttrSilenceIndex: @([self.mutableSilences indexOfObject:silence]),
+                            NSToolTipAttributeName: [NSString stringWithFormat:@"Pause: %.1fs (%@ - %@)",
+                                silence.duration,
+                                FCPTranscript_timecodeFromSeconds(silence.startTime, self.frameRate),
+                                FCPTranscript_timecodeFromSeconds(silence.endTime, self.frameRate)],
+                        }];
+
+                        silence.textRange = NSMakeRange(textPos, silenceStr.length);
+
+                        [attrStr appendAttributedString:[[NSAttributedString alloc]
+                            initWithString:silenceStr attributes:silenceAttrs]];
+                        textPos += silenceStr.length;
+                    } else if (i > segStart) {
+                        // Regular space between words within the same segment
+                        [attrStr appendAttributedString:[[NSAttributedString alloc]
+                            initWithString:@" " attributes:normalAttrs]];
+                        textPos += 1;
+                    }
+                } else if (i > segStart) {
                     [attrStr appendAttributedString:[[NSAttributedString alloc]
                         initWithString:@" " attributes:normalAttrs]];
                     textPos += 1;
                 }
+
+                // Word
+                NSDictionary *attrs = (word.confidence < 0.5) ? lowConfAttrs : normalAttrs;
+                word.textRange = NSMakeRange(textPos, word.text.length);
+
+                NSMutableDictionary *wordAttrs = [attrs mutableCopy];
+                wordAttrs[NSToolTipAttributeName] = [NSString stringWithFormat:@"%@ - %@ (%.0f%%)",
+                    FCPTranscript_timecodeFromSeconds(word.startTime, self.frameRate),
+                    FCPTranscript_timecodeFromSeconds(word.endTime, self.frameRate),
+                    word.confidence * 100];
+                wordAttrs[FCPAttrWordIndex] = @(i);
+
+                [attrStr appendAttributedString:[[NSAttributedString alloc]
+                    initWithString:word.text attributes:wordAttrs]];
+                textPos += word.text.length;
             }
-
-            // Record text range for this word
-            word.textRange = NSMakeRange(textPos, word.text.length);
-
-            // Add word with tooltip showing time
-            NSMutableDictionary *wordAttrs = [attrs mutableCopy];
-            wordAttrs[NSToolTipAttributeName] = [NSString stringWithFormat:@"%.2fs - %.2fs (%.0f%%)",
-                word.startTime, word.endTime, word.confidence * 100];
-            wordAttrs[@"FCPWordIndex"] = @(i);
-
-            [attrStr appendAttributedString:[[NSAttributedString alloc]
-                initWithString:word.text attributes:wordAttrs]];
-            textPos += word.text.length;
         }
     }
 
@@ -1201,23 +2756,53 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     self.fullText = [attrStr string];
 
     self.suppressTextViewCallbacks = NO;
+
+    // Re-apply search highlighting if active
+    if (self.currentSearchQuery.length > 0 || ![self.currentFilter isEqualToString:@"all"]) {
+        [self performSearchHighlighting];
+    }
 }
 
 #pragma mark - Click Handling (Jump Playhead)
 
 - (void)handleClickAtCharIndex:(NSUInteger)charIdx {
-    FCPTranscriptWord *word = [self wordAtCharIndex:charIdx];
-    if (!word) return;
+    if (charIdx >= self.textView.textStorage.length) return;
 
-    FCPBridge_log(@"[Transcript] Clicked word %lu: \"%@\" at %.2fs",
-                  (unsigned long)word.wordIndex, word.text, word.startTime);
+    // Check what type of item was clicked
+    NSDictionary *attrs = [self.textView.textStorage attributesAtIndex:charIdx effectiveRange:nil];
+    NSString *itemType = attrs[FCPAttrItemType];
 
-    // Jump playhead to word's start time
-    [self setPlayheadToTime:word.startTime];
+    if ([itemType isEqualToString:@"word"]) {
+        FCPTranscriptWord *word = [self wordAtCharIndex:charIdx];
+        if (!word) return;
 
-    // Highlight the clicked word briefly
-    [self highlightWordRange:NSMakeRange(word.wordIndex, 1)
-                       color:[NSColor selectedTextBackgroundColor]];
+        FCPBridge_log(@"[Transcript] Clicked word %lu: \"%@\" at %.2fs",
+                      (unsigned long)word.wordIndex, word.text, word.startTime);
+
+        [self setPlayheadToTime:word.startTime];
+        [self highlightWordRange:NSMakeRange(word.wordIndex, 1)
+                           color:[NSColor selectedTextBackgroundColor]];
+
+    } else if ([itemType isEqualToString:@"speakerLabel"]) {
+        NSString *currentName = attrs[FCPAttrSpeakerName];
+        NSUInteger segStart = [attrs[FCPAttrSegmentStartIndex] unsignedIntegerValue];
+        NSUInteger segEnd = [attrs[FCPAttrSegmentEndIndex] unsignedIntegerValue];
+        if (currentName) {
+            [self showSpeakerRenamePopoverForSpeaker:currentName
+                                        segmentStart:segStart
+                                          segmentEnd:segEnd
+                                         atCharIndex:charIdx];
+        }
+
+    } else if ([itemType isEqualToString:@"silence"]) {
+        NSNumber *silenceIdx = attrs[FCPAttrSilenceIndex];
+        if (silenceIdx && silenceIdx.unsignedIntegerValue < self.mutableSilences.count) {
+            FCPTranscriptSilence *silence = self.mutableSilences[silenceIdx.unsignedIntegerValue];
+            FCPBridge_log(@"[Transcript] Clicked silence at %.2fs (%.1fs duration)",
+                          silence.startTime, silence.duration);
+            [self setPlayheadToTime:silence.startTime];
+        }
+    }
 }
 
 - (FCPTranscriptWord *)wordAtCharIndex:(NSUInteger)charIdx {
@@ -1230,6 +2815,120 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         }
     }
     return nil;
+}
+
+#pragma mark - Speaker Rename Popover
+
+- (void)showSpeakerRenamePopoverForSpeaker:(NSString *)currentName
+                              segmentStart:(NSUInteger)segStart
+                                segmentEnd:(NSUInteger)segEnd
+                               atCharIndex:(NSUInteger)charIdx {
+
+    // Build the popover content view
+    NSView *contentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 280, 80)];
+
+    // Text field for new name
+    NSTextField *nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 44, 256, 24)];
+    nameField.stringValue = currentName;
+    nameField.placeholderString = @"Enter speaker name...";
+    nameField.font = [NSFont systemFontOfSize:13];
+    nameField.bezelStyle = NSTextFieldRoundedBezel;
+    [nameField selectText:nil];
+    [contentView addSubview:nameField];
+
+    // "Rename all" checkbox
+    NSButton *renameAllCheckbox = [NSButton checkboxWithTitle:
+        [NSString stringWithFormat:@"Rename all \"%@\" instances", currentName]
+                                                      target:nil action:nil];
+    renameAllCheckbox.frame = NSMakeRect(12, 12, 200, 20);
+    renameAllCheckbox.font = [NSFont systemFontOfSize:11];
+    renameAllCheckbox.state = NSControlStateValueOn;
+    [contentView addSubview:renameAllCheckbox];
+
+    // Apply button
+    NSButton *applyButton = [NSButton buttonWithTitle:@"Rename" target:nil action:nil];
+    applyButton.frame = NSMakeRect(214, 8, 56, 28);
+    applyButton.bezelStyle = NSBezelStyleRounded;
+    applyButton.keyEquivalent = @"\r"; // Enter key
+    [contentView addSubview:applyButton];
+
+    // Create popover
+    NSPopover *popover = [[NSPopover alloc] init];
+    popover.behavior = NSPopoverBehaviorTransient;
+    popover.contentSize = NSMakeSize(280, 80);
+
+    NSViewController *vc = [[NSViewController alloc] init];
+    vc.view = contentView;
+    popover.contentViewController = vc;
+
+    // Wire up the apply action
+    __weak typeof(self) weakSelf = self;
+    __weak NSPopover *weakPopover = popover;
+    applyButton.target = self;
+    applyButton.action = @selector(_speakerRenameApply:);
+
+    // Store context for the action via objc_setAssociatedObject
+    objc_setAssociatedObject(applyButton, "nameField", nameField, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(applyButton, "renameAll", renameAllCheckbox, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(applyButton, "oldName", currentName, OBJC_ASSOCIATION_COPY);
+    objc_setAssociatedObject(applyButton, "segStart", @(segStart), OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(applyButton, "segEnd", @(segEnd), OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(applyButton, "popover", popover, OBJC_ASSOCIATION_RETAIN);
+
+    // Show popover relative to the clicked text
+    NSRange glyphRange = [self.textView.layoutManager glyphRangeForCharacterRange:NSMakeRange(charIdx, 1) actualCharacterRange:nil];
+    NSRect rect = [self.textView.layoutManager boundingRectForGlyphRange:glyphRange inTextContainer:self.textView.textContainer];
+    rect.origin.x += self.textView.textContainerOrigin.x;
+    rect.origin.y += self.textView.textContainerOrigin.y;
+
+    [popover showRelativeToRect:rect ofView:self.textView preferredEdge:NSMaxYEdge];
+
+    // Focus the text field
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [nameField selectText:nil];
+        [nameField.window makeFirstResponder:nameField];
+    });
+}
+
+- (void)_speakerRenameApply:(NSButton *)sender {
+    NSTextField *nameField = objc_getAssociatedObject(sender, "nameField");
+    NSButton *renameAllCheckbox = objc_getAssociatedObject(sender, "renameAll");
+    NSString *oldName = objc_getAssociatedObject(sender, "oldName");
+    NSNumber *segStartNum = objc_getAssociatedObject(sender, "segStart");
+    NSNumber *segEndNum = objc_getAssociatedObject(sender, "segEnd");
+    NSPopover *popover = objc_getAssociatedObject(sender, "popover");
+
+    NSString *newName = nameField.stringValue;
+    if (newName.length == 0 || [newName isEqualToString:oldName]) {
+        [popover close];
+        return;
+    }
+
+    BOOL renameAll = (renameAllCheckbox.state == NSControlStateValueOn);
+
+    @synchronized (self.mutableWords) {
+        if (renameAll) {
+            // Rename all words with this speaker name
+            for (FCPTranscriptWord *word in self.mutableWords) {
+                if ([word.speaker isEqualToString:oldName]) {
+                    word.speaker = newName;
+                }
+            }
+            FCPBridge_log(@"[Transcript] Renamed all \"%@\" -> \"%@\"", oldName, newName);
+        } else {
+            // Rename only this segment
+            NSUInteger start = segStartNum.unsignedIntegerValue;
+            NSUInteger end = segEndNum.unsignedIntegerValue;
+            for (NSUInteger i = start; i <= end && i < self.mutableWords.count; i++) {
+                self.mutableWords[i].speaker = newName;
+            }
+            FCPBridge_log(@"[Transcript] Renamed segment %lu-%lu \"%@\" -> \"%@\"",
+                (unsigned long)start, (unsigned long)end, oldName, newName);
+        }
+    }
+
+    [popover close];
+    [self rebuildTextView];
 }
 
 #pragma mark - Delete Words (Text-Based Editing)
@@ -1252,8 +2951,55 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         }
     }
 
-    if (wordIndices.count == 0) {
+    // Also check if any silences are fully selected (for deleting pauses)
+    NSMutableArray<FCPTranscriptSilence *> *selectedSilences = [NSMutableArray array];
+    for (FCPTranscriptSilence *silence in self.mutableSilences) {
+        NSRange intersection = NSIntersectionRange(selectedRange, silence.textRange);
+        if (intersection.length > 0) {
+            [selectedSilences addObject:silence];
+        }
+    }
+
+    if (wordIndices.count == 0 && selectedSilences.count == 0) {
         NSBeep();
+        return;
+    }
+
+    // If only silences selected (no words), delete those silence segments
+    if (wordIndices.count == 0 && selectedSilences.count > 0) {
+        [self updateStatusUI:@"Deleting pauses..."];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            // Delete from end to start to avoid position shifts
+            NSArray *sorted = [selectedSilences sortedArrayUsingComparator:^NSComparisonResult(FCPTranscriptSilence *a, FCPTranscriptSilence *b) {
+                return (a.startTime > b.startTime) ? NSOrderedAscending : NSOrderedDescending;
+            }];
+            double totalRemoved = 0;
+            for (FCPTranscriptSilence *silence in sorted) {
+                // Adjust for already-removed time
+                double adjStart = silence.startTime - totalRemoved;
+                double adjEnd = silence.endTime - totalRemoved;
+                [self deleteTimelineRange:adjStart end:adjEnd];
+                double removed = silence.duration;
+                totalRemoved += removed;
+
+                // Shift all words after this silence earlier
+                @synchronized (self.mutableWords) {
+                    for (FCPTranscriptWord *word in self.mutableWords) {
+                        if (word.startTime > silence.startTime - (totalRemoved - removed)) {
+                            word.startTime -= removed;
+                        }
+                    }
+                }
+            }
+
+            [self detectSilences];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self rebuildTextView];
+                self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+                [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses",
+                    (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count]];
+            });
+        });
         return;
     }
 
@@ -1263,7 +3009,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     FCPBridge_log(@"[Transcript] Deleting %lu words starting at index %lu",
                   (unsigned long)count, (unsigned long)startIdx);
 
-    // Perform the delete operation
     NSDictionary *result = [self deleteWordsFromIndex:startIdx count:count];
     FCPBridge_log(@"[Transcript] Delete result: %@", result);
 }
@@ -1293,13 +3038,11 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
 - (NSUInteger)wordIndexAtCharIndex:(NSUInteger)charIdx {
     @synchronized (self.mutableWords) {
-        // Find the word at or just after charIdx
         for (FCPTranscriptWord *word in self.mutableWords) {
             if (charIdx <= word.textRange.location) {
                 return word.wordIndex;
             }
             if (charIdx < NSMaxRange(word.textRange)) {
-                // Dropped in the middle of a word — decide left or right half
                 NSUInteger midpoint = word.textRange.location + word.textRange.length / 2;
                 if (charIdx <= midpoint) {
                     return word.wordIndex;
@@ -1309,14 +3052,12 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
             }
         }
     }
-    // Past the end
     return self.mutableWords.count;
 }
 
 - (void)handleDropOfWordStart:(NSUInteger)srcStart count:(NSUInteger)srcCount atCharIndex:(NSUInteger)charIdx {
     NSUInteger destWordIdx = [self wordIndexAtCharIndex:charIdx];
 
-    // Don't move to the same position
     if (destWordIdx >= srcStart && destWordIdx <= srcStart + srcCount) {
         FCPBridge_log(@"[Transcript] Drop at same position — no-op");
         return;
@@ -1342,6 +3083,65 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     });
 }
 
+#pragma mark - Timeline Editing Operations
+
+- (NSDictionary *)deleteTimelineRange:(double)deleteStart end:(double)deleteEnd {
+    __block NSDictionary *result = nil;
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = [self getActiveTimelineModule];
+            if (!timeline) {
+                result = @{@"error": @"No active timeline"};
+                return;
+            }
+
+            // Blade at start
+            [self setPlayheadToTime:deleteStart];
+            [NSThread sleepForTimeInterval:0.05];
+
+            SEL bladeSel = NSSelectorFromString(@"blade:");
+            if ([timeline respondsToSelector:bladeSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
+            }
+            [NSThread sleepForTimeInterval:0.05];
+
+            // Blade at end
+            [self setPlayheadToTime:deleteEnd];
+            [NSThread sleepForTimeInterval:0.05];
+
+            if ([timeline respondsToSelector:bladeSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
+            }
+            [NSThread sleepForTimeInterval:0.05];
+
+            // Select clip at midpoint
+            double midPoint = (deleteStart + deleteEnd) / 2.0;
+            [self setPlayheadToTime:midPoint];
+            [NSThread sleepForTimeInterval:0.05];
+
+            SEL selectSel = NSSelectorFromString(@"selectClipAtPlayhead:");
+            if ([timeline respondsToSelector:selectSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(timeline, selectSel, nil);
+            }
+            [NSThread sleepForTimeInterval:0.05];
+
+            // Delete (ripple delete)
+            SEL deleteSel = NSSelectorFromString(@"delete:");
+            if ([timeline respondsToSelector:deleteSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(timeline, deleteSel, nil);
+            }
+
+            result = @{@"status": @"ok",
+                       @"timeRange": @{@"start": @(deleteStart), @"end": @(deleteEnd)},
+                       @"duration": @(deleteEnd - deleteStart)};
+
+        } @catch (NSException *e) {
+            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+        }
+    });
+    return result;
+}
+
 - (NSDictionary *)deleteWordsFromIndex:(NSUInteger)startIndex count:(NSUInteger)count {
     @synchronized (self.mutableWords) {
         if (startIndex >= self.mutableWords.count) {
@@ -1352,98 +3152,151 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         }
     }
 
-    // Get the time range to delete
     FCPTranscriptWord *firstWord = self.mutableWords[startIndex];
     FCPTranscriptWord *lastWord = self.mutableWords[startIndex + count - 1];
     double deleteStart = firstWord.startTime;
     double deleteEnd = lastWord.endTime;
+    double deletedDuration = deleteEnd - deleteStart;
 
-    FCPBridge_log(@"[Transcript] Deleting words %lu-%lu: %.2fs - %.2fs",
+    FCPBridge_log(@"[Transcript] Deleting words %lu-%lu: %.2fs - %.2fs (%.2fs)",
                   (unsigned long)startIndex, (unsigned long)(startIndex + count - 1),
-                  deleteStart, deleteEnd);
+                  deleteStart, deleteEnd, deletedDuration);
 
-    // Perform timeline edit: blade at start, blade at end, select segment, delete
-    __block NSDictionary *result = nil;
-    FCPBridge_executeOnMainThread(^{
-        @try {
-            id timeline = [self getActiveTimelineModule];
-            if (!timeline) {
-                result = @{@"error": @"No active timeline"};
-                return;
-            }
-
-            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
-            if (!sequence) {
-                result = @{@"error": @"No sequence"};
-                return;
-            }
-
-            // Get frame duration for precision
-            double frameDuration = 1.0 / 24.0; // default 24fps
-            if ([timeline respondsToSelector:@selector(sequenceFrameDuration)]) {
-                FCPTranscript_CMTime fd = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
-                    timeline, @selector(sequenceFrameDuration));
-                if (fd.timescale > 0) frameDuration = (double)fd.value / fd.timescale;
-            }
-
-            // Step 1: Move playhead to delete start and blade
-            [self setPlayheadToTime:deleteStart];
-            // Small delay for UI to update
-            [NSThread sleepForTimeInterval:0.05];
-
-            SEL bladeSel = NSSelectorFromString(@"blade:");
-            if ([timeline respondsToSelector:bladeSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
-                FCPBridge_log(@"[Transcript] Blade at %.2fs", deleteStart);
-            }
-            [NSThread sleepForTimeInterval:0.05];
-
-            // Step 2: Move playhead to delete end and blade
-            [self setPlayheadToTime:deleteEnd];
-            [NSThread sleepForTimeInterval:0.05];
-
-            if ([timeline respondsToSelector:bladeSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
-                FCPBridge_log(@"[Transcript] Blade at %.2fs", deleteEnd);
-            }
-            [NSThread sleepForTimeInterval:0.05];
-
-            // Step 3: Move playhead to middle of the deleted segment
-            double midPoint = (deleteStart + deleteEnd) / 2.0;
-            [self setPlayheadToTime:midPoint];
-            [NSThread sleepForTimeInterval:0.05];
-
-            // Step 4: Select clip at playhead
-            SEL selectSel = NSSelectorFromString(@"selectClipAtPlayhead:");
-            if ([timeline respondsToSelector:selectSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, selectSel, nil);
-                FCPBridge_log(@"[Transcript] Selected clip at playhead");
-            }
-            [NSThread sleepForTimeInterval:0.05];
-
-            // Step 5: Delete (ripple delete)
-            SEL deleteSel = NSSelectorFromString(@"delete:");
-            if ([timeline respondsToSelector:deleteSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, deleteSel, nil);
-                FCPBridge_log(@"[Transcript] Deleted segment");
-            }
-
-            result = @{@"status": @"ok",
-                       @"deletedWords": @(count),
-                       @"timeRange": @{@"start": @(deleteStart), @"end": @(deleteEnd)},
-                       @"duration": @(deleteEnd - deleteStart)};
-
-        } @catch (NSException *e) {
-            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
-        }
-    });
+    NSDictionary *result = [self deleteTimelineRange:deleteStart end:deleteEnd];
 
     if (result[@"error"]) return result;
 
-    // Re-transcribe from timeline to get accurate timestamps after the edit
-    [self scheduleRetranscribe];
+    // Remove deleted words from the data model
+    @synchronized (self.mutableWords) {
+        [self.mutableWords removeObjectsInRange:NSMakeRange(startIndex, count)];
+        for (NSUInteger i = startIndex; i < self.mutableWords.count; i++) {
+            self.mutableWords[i].wordIndex = i;
+        }
+    }
 
-    return result;
+    // Resync timestamps from the actual FCP timeline state
+    [self resyncTimestampsFromTimeline];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self rebuildTextView];
+        self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+        [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses",
+            (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count]];
+    });
+
+    NSMutableDictionary *fullResult = [result mutableCopy];
+    fullResult[@"deletedWords"] = @(count);
+    return fullResult;
+}
+
+#pragma mark - Delete Silences (Batch)
+
+- (NSDictionary *)deleteAllSilences {
+    return [self deleteSilencesLongerThan:0];
+}
+
+- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration {
+    // Collect silences to delete (filter by minimum duration)
+    NSMutableArray<FCPTranscriptSilence *> *toDelete = [NSMutableArray array];
+    for (FCPTranscriptSilence *silence in self.mutableSilences) {
+        if (silence.duration >= minDuration) {
+            [toDelete addObject:silence];
+        }
+    }
+
+    if (toDelete.count == 0) {
+        return @{@"status": @"ok", @"deletedCount": @0, @"message": @"No silences to delete"};
+    }
+
+    FCPBridge_log(@"[Transcript] Batch deleting %lu silences (min duration: %.2fs)",
+                  (unsigned long)toDelete.count, minDuration);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateStatusUI:[NSString stringWithFormat:@"Deleting %lu pauses...", (unsigned long)toDelete.count]];
+        self.spinner.hidden = NO;
+        [self.spinner startAnimation:nil];
+        self.deleteSilencesButton.enabled = NO;
+    });
+
+    // Sort by startTime descending (delete from end first to avoid position shifts)
+    [toDelete sortUsingComparator:^NSComparisonResult(FCPTranscriptSilence *a, FCPTranscriptSilence *b) {
+        return (a.startTime > b.startTime) ? NSOrderedAscending : NSOrderedDescending;
+    }];
+
+    __block NSUInteger deletedCount = 0;
+    __block NSString *lastError = nil;
+    double totalTimeRemoved = 0;
+
+    for (FCPTranscriptSilence *silence in toDelete) {
+        // Adjust times for already-removed content
+        double adjStart = silence.startTime - totalTimeRemoved;
+        double adjEnd = silence.endTime - totalTimeRemoved;
+
+        NSDictionary *result = [self deleteTimelineRange:adjStart end:adjEnd];
+        if (result[@"error"]) {
+            lastError = result[@"error"];
+            FCPBridge_log(@"[Transcript] Error deleting silence at %.2fs: %@", adjStart, lastError);
+        } else {
+            deletedCount++;
+            totalTimeRemoved += silence.duration;
+        }
+        [NSThread sleepForTimeInterval:0.1];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatusUI:[NSString stringWithFormat:@"Deleting pauses... %lu/%lu",
+                (unsigned long)deletedCount, (unsigned long)toDelete.count]];
+        });
+    }
+
+    // Update data model locally: shift all word times by cumulative removed durations
+    @synchronized (self.mutableWords) {
+        // Rebuild all word times from scratch based on which silences were removed
+        // Go through silences in forward order (original times) and compute shift
+        double cumulativeShift = 0;
+        NSUInteger silIdx = 0;
+
+        // toDelete is sorted descending, reverse it for forward processing
+        NSArray *forwardSilences = [[toDelete reverseObjectEnumerator] allObjects];
+
+        for (FCPTranscriptWord *word in self.mutableWords) {
+            // Advance past silences that ended before this word
+            while (silIdx < forwardSilences.count) {
+                FCPTranscriptSilence *s = forwardSilences[silIdx];
+                if (s.endTime <= word.startTime) {
+                    cumulativeShift += s.duration;
+                    silIdx++;
+                } else {
+                    break;
+                }
+            }
+            word.startTime -= cumulativeShift;
+        }
+
+        // Re-index
+        for (NSUInteger i = 0; i < self.mutableWords.count; i++) {
+            self.mutableWords[i].wordIndex = i;
+        }
+    }
+
+    [self detectSilences];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self rebuildTextView];
+        self.spinner.hidden = YES;
+        [self.spinner stopAnimation:nil];
+        self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+        [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses — removed %lu silences",
+            (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count,
+            (unsigned long)deletedCount]];
+    });
+
+    NSMutableDictionary *response = [NSMutableDictionary dictionary];
+    response[@"status"] = lastError ? @"partial" : @"ok";
+    response[@"deletedCount"] = @(deletedCount);
+    response[@"totalSilences"] = @(toDelete.count);
+    response[@"timeRemoved"] = @(totalTimeRemoved);
+    if (lastError) response[@"lastError"] = lastError;
+
+    return response;
 }
 
 #pragma mark - Move Words (Drag to Reorder)
@@ -1456,7 +3309,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         if (startIndex + count > self.mutableWords.count) {
             count = self.mutableWords.count - startIndex;
         }
-        // Can't move to within the source range
         if (destIndex > startIndex && destIndex < startIndex + count) {
             return @{@"error": @"Cannot move to within source range"};
         }
@@ -1468,7 +3320,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     double sourceEnd = lastWord.endTime;
     double sourceDuration = sourceEnd - sourceStart;
 
-    // Calculate destination time
     double destTime;
     if (destIndex == 0) {
         destTime = 0;
@@ -1519,8 +3370,7 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
             ((void (*)(id, SEL, id))objc_msgSend)(timeline, cutSel, nil);
             [NSThread sleepForTimeInterval:0.1];
 
-            // Step 5: Move playhead to destination
-            // After cutting, positions shift. Adjust destination if it was after source.
+            // Step 5: Move playhead to destination (adjust for position shift)
             double adjustedDestTime = destTime;
             if (destTime > sourceStart) {
                 adjustedDestTime -= sourceDuration;
@@ -1544,15 +3394,42 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
     if (result[@"error"]) return result;
 
-    // Re-transcribe from timeline to get accurate timestamps after the edit
-    [self scheduleRetranscribe];
+    // Update data model locally: reorder words in the array
+    @synchronized (self.mutableWords) {
+        NSArray *movedWords = [self.mutableWords subarrayWithRange:NSMakeRange(startIndex, count)];
+        [self.mutableWords removeObjectsInRange:NSMakeRange(startIndex, count)];
+
+        NSUInteger adjustedDest = destIndex;
+        if (destIndex > startIndex) {
+            adjustedDest -= count;
+        }
+        adjustedDest = MIN(adjustedDest, self.mutableWords.count);
+
+        NSIndexSet *insertIndices = [NSIndexSet indexSetWithIndexesInRange:
+            NSMakeRange(adjustedDest, count)];
+        [self.mutableWords insertObjects:movedWords atIndexes:insertIndices];
+
+        // Re-index
+        for (NSUInteger i = 0; i < self.mutableWords.count; i++) {
+            self.mutableWords[i].wordIndex = i;
+        }
+    }
+
+    // Resync timestamps from the actual FCP timeline state
+    [self resyncTimestampsFromTimeline];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self rebuildTextView];
+        self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
+        [self updateStatusUI:[NSString stringWithFormat:@"Moved %lu words — %lu words, %lu pauses",
+            (unsigned long)count, (unsigned long)self.mutableWords.count,
+            (unsigned long)self.mutableSilences.count]];
+    });
 
     return result;
 }
 
 - (void)scheduleRetranscribe {
-    // After an edit, wait briefly for FCP to settle then re-transcribe
-    // so word timestamps match the new timeline layout
     FCPBridge_log(@"[Transcript] Scheduling re-transcribe after edit...");
     dispatch_async(dispatch_get_main_queue(), ^{
         [self updateStatusUI:@"Refreshing transcript..."];
@@ -1564,6 +3441,119 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self performTimelineTranscription];
     });
+}
+
+#pragma mark - Resync Timestamps from Timeline
+
+- (void)resyncTimestampsFromTimeline {
+    // After edits (move, delete), re-read actual clip positions from FCP's timeline.
+    // Each word has an immutable sourceMediaTime (its position in the source file).
+    // We match each word to the clip that contains its source time, then compute:
+    //   word.startTime = clip.timelineStart + (word.sourceMediaTime - clip.trimStart)
+    FCPBridge_log(@"[Transcript] Resyncing timestamps from timeline...");
+
+    // Give FCP a moment to settle after the edit
+    [NSThread sleepForTimeInterval:0.3];
+
+    __block NSArray *clipInfos = nil;
+
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = [self getActiveTimelineModule];
+            if (!timeline) return;
+
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+            if (!sequence) return;
+
+            id primaryObj = nil;
+            if ([sequence respondsToSelector:@selector(primaryObject)]) {
+                primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+            }
+            if (!primaryObj) return;
+
+            id items = nil;
+            if ([primaryObj respondsToSelector:@selector(containedItems)]) {
+                items = ((id (*)(id, SEL))objc_msgSend)(primaryObj, @selector(containedItems));
+            }
+            if (!items || ![items isKindOfClass:[NSArray class]]) return;
+
+            NSMutableArray *infos = [NSMutableArray array];
+            double timelinePos = 0;
+            [self collectClipsFrom:(NSArray *)items atTimeline:&timelinePos into:infos];
+            clipInfos = [infos copy];
+        } @catch (NSException *e) {
+            FCPBridge_log(@"[Transcript] Resync error: %@", e.reason);
+        }
+    });
+
+    if (!clipInfos || clipInfos.count == 0) {
+        FCPBridge_log(@"[Transcript] Resync: no clips found");
+        return;
+    }
+
+    // Build actual clip segments with media paths for matching
+    NSMutableArray *actualClips = [NSMutableArray array];
+    for (NSDictionary *info in clipInfos) {
+        NSURL *mediaURL = info[@"mediaURL"];
+        if (mediaURL) {
+            [actualClips addObject:@{
+                @"timelineStart": info[@"timelineStart"] ?: @0,
+                @"trimStart": info[@"trimStart"] ?: @0,
+                @"duration": info[@"duration"] ?: @0,
+                @"path": mediaURL.path ?: @"",
+            }];
+        }
+    }
+
+    FCPBridge_log(@"[Transcript] Resync: found %lu clips on timeline", (unsigned long)actualClips.count);
+
+    @synchronized (self.mutableWords) {
+        if (self.mutableWords.count == 0) return;
+
+        NSUInteger matched = 0, unmatched = 0;
+
+        for (FCPTranscriptWord *word in self.mutableWords) {
+            double smt = word.sourceMediaTime;
+            NSString *path = word.sourceMediaPath;
+            BOOL found = NO;
+
+            // Find the clip on the timeline that contains this word's source media time.
+            // After blade operations, the original clip may be split into multiple
+            // clips with different trimStart/duration ranges.
+            for (NSDictionary *clip in actualClips) {
+                double clipTrimStart = [clip[@"trimStart"] doubleValue];
+                double clipDuration = [clip[@"duration"] doubleValue];
+                double clipTimelineStart = [clip[@"timelineStart"] doubleValue];
+                NSString *clipPath = clip[@"path"];
+
+                // Match by source media path and source time within clip's trim range
+                BOOL pathMatch = (!path || !clipPath || path.length == 0 ||
+                                  [path isEqualToString:clipPath]);
+                BOOL timeMatch = (smt >= clipTrimStart - 0.01 &&
+                                  smt < clipTrimStart + clipDuration + 0.01);
+
+                if (pathMatch && timeMatch) {
+                    double newStartTime = clipTimelineStart + (smt - clipTrimStart);
+                    word.startTime = newStartTime;
+                    word.clipTimelineStart = clipTimelineStart;
+                    word.sourceMediaOffset = clipTrimStart;
+                    found = YES;
+                    matched++;
+                    break;
+                }
+            }
+
+            if (!found) {
+                unmatched++;
+            }
+        }
+
+        FCPBridge_log(@"[Transcript] Resync: matched %lu words, %lu unmatched",
+                      (unsigned long)matched, (unsigned long)unmatched);
+    }
+
+    [self detectSilences];
+    FCPBridge_log(@"[Transcript] Resync complete");
 }
 
 #pragma mark - Playhead Sync
@@ -1587,13 +3577,11 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     if (self.mutableWords.count == 0) return;
     if (!self.panel.isVisible) return;
 
-    // Get current playhead time — try multiple sources for accuracy during playback
     __block double playheadTime = -1;
     @try {
         id timeline = [self getActiveTimelineModule];
         if (!timeline) return;
 
-        // During playback, currentSequenceTime updates in real time
         SEL currentTimeSel = NSSelectorFromString(@"currentSequenceTime");
         if ([timeline respondsToSelector:currentTimeSel]) {
             FCPTranscript_CMTime t = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
@@ -1602,14 +3590,12 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
             if (secs >= 0) playheadTime = secs;
         }
 
-        // Fall back to playheadTime if currentSequenceTime didn't work
         if (playheadTime < 0 && [timeline respondsToSelector:@selector(playheadTime)]) {
             FCPTranscript_CMTime t = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
                 timeline, @selector(playheadTime));
             playheadTime = CMTimeToSeconds(t);
         }
 
-        // Also try the editor container's playheadSequenceTime
         if (playheadTime < 0) {
             id container = [self getEditorContainer];
             SEL pstSel = NSSelectorFromString(@"playheadSequenceTime");
@@ -1629,28 +3615,45 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 - (void)updatePlayheadHighlight:(double)timeInSeconds {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.suppressTextViewCallbacks) return;
-        self.suppressTextViewCallbacks = YES;
+        if (self.searchResultRanges.count > 0) return;
 
         NSTextStorage *storage = self.textView.textStorage;
-        NSRange fullRange = NSMakeRange(0, storage.length);
+        NSUInteger storageLen = storage.length;
+        if (storageLen == 0) return;
 
-        // Clear all highlights
-        [storage removeAttribute:NSBackgroundColorAttributeName range:fullRange];
-
-        // Find current word and highlight it
+        // Find which word the playhead is on
+        NSRange newRange = NSMakeRange(NSNotFound, 0);
         @synchronized (self.mutableWords) {
             for (FCPTranscriptWord *word in self.mutableWords) {
                 if (timeInSeconds >= word.startTime && timeInSeconds < word.endTime) {
-                    if (word.textRange.location + word.textRange.length <= storage.length) {
-                        [storage addAttribute:NSBackgroundColorAttributeName
-                                        value:[NSColor colorWithCalibratedRed:0.2 green:0.5 blue:1.0 alpha:0.3]
-                                        range:word.textRange];
+                    if (word.textRange.location + word.textRange.length <= storageLen) {
+                        newRange = word.textRange;
                     }
                     break;
                 }
             }
         }
 
+        // Skip update if same word is already highlighted
+        if (NSEqualRanges(newRange, self.lastPlayheadHighlightRange)) return;
+
+        self.suppressTextViewCallbacks = YES;
+
+        // Clear only the previous highlight (not the whole document)
+        if (self.lastPlayheadHighlightRange.location != NSNotFound &&
+            self.lastPlayheadHighlightRange.location + self.lastPlayheadHighlightRange.length <= storageLen) {
+            [storage removeAttribute:NSBackgroundColorAttributeName
+                               range:self.lastPlayheadHighlightRange];
+        }
+
+        // Apply new highlight
+        if (newRange.location != NSNotFound) {
+            [storage addAttribute:NSBackgroundColorAttributeName
+                            value:[NSColor colorWithCalibratedRed:0.2 green:0.5 blue:1.0 alpha:0.3]
+                            range:newRange];
+        }
+
+        self.lastPlayheadHighlightRange = newRange;
         self.suppressTextViewCallbacks = NO;
     });
 }
@@ -1674,7 +3677,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
         self.suppressTextViewCallbacks = NO;
 
-        // Clear highlight after 0.5s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             self.suppressTextViewCallbacks = YES;
@@ -1713,8 +3715,7 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     id timeline = [self getActiveTimelineModule];
     if (!timeline) return;
 
-    // Get the sequence's timescale
-    int32_t timescale = 600; // default (supports 24, 25, 30fps precisely)
+    int32_t timescale = 600;
     if ([timeline respondsToSelector:@selector(sequenceFrameDuration)]) {
         FCPTranscript_CMTime fd = ((FCPTranscript_CMTime (*)(id, SEL))objc_msgSend)(
             timeline, @selector(sequenceFrameDuration));
@@ -1742,6 +3743,10 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     }
 }
 
+- (NSArray<FCPTranscriptSilence *> *)silences {
+    return [self.mutableSilences copy];
+}
+
 - (NSDictionary *)getState {
     NSMutableDictionary *state = [NSMutableDictionary dictionary];
 
@@ -1754,6 +3759,13 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
     state[@"visible"] = @(self.isVisible);
     state[@"wordCount"] = @(self.mutableWords.count);
+    state[@"silenceCount"] = @(self.mutableSilences.count);
+    state[@"silenceThreshold"] = @(self.silenceThreshold);
+    state[@"frameRate"] = @(self.frameRate);
+    state[@"engine"] = (self.engine == FCPTranscriptEngineFCPNative) ? @"fcpNative" :
+                       (self.engine == FCPTranscriptEngineWhisper) ? @"whisper" : @"appleSpeech";
+    state[@"speakerDetectionAvailable"] = @(FCPTranscript_isSpeakerDiarizationAvailable());
+    state[@"speakerDetectionEnabled"] = @(self.speakerDetectionEnabled);
 
     if (self.errorMessage) {
         state[@"errorMessage"] = self.errorMessage;
@@ -1780,11 +3792,27 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                     @"startTime": @(word.startTime),
                     @"endTime": @(word.endTime),
                     @"duration": @(word.duration),
-                    @"confidence": @(word.confidence)
+                    @"confidence": @(word.confidence),
+                    @"speaker": word.speaker ?: @"Unknown"
                 }];
             }
         }
         state[@"words"] = wordList;
+    }
+
+    if (self.mutableSilences.count > 0) {
+        NSMutableArray *silenceList = [NSMutableArray array];
+        for (FCPTranscriptSilence *silence in self.mutableSilences) {
+            [silenceList addObject:@{
+                @"startTime": @(silence.startTime),
+                @"endTime": @(silence.endTime),
+                @"duration": @(silence.duration),
+                @"afterWordIndex": @(silence.afterWordIndex),
+                @"startTimecode": FCPTranscript_timecodeFromSeconds(silence.startTime, self.frameRate),
+                @"endTimecode": FCPTranscript_timecodeFromSeconds(silence.endTime, self.frameRate),
+            }];
+        }
+        state[@"silences"] = silenceList;
     }
 
     return state;
@@ -1798,6 +3826,14 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     });
 }
 
+- (void)openSpeechRecognitionSettings {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // macOS 13+ uses the new System Settings URL scheme
+        NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"];
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    });
+}
+
 - (void)setErrorState:(NSString *)error {
     FCPBridge_log(@"[Transcript] Error: %@", error);
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1806,7 +3842,9 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         [self updateStatusUI:[NSString stringWithFormat:@"Error: %@", error]];
         self.spinner.hidden = YES;
         [self.spinner stopAnimation:nil];
+        self.progressBar.hidden = YES;
         self.refreshButton.enabled = YES;
+        self.deleteSilencesButton.enabled = NO;
     });
 }
 
@@ -1815,7 +3853,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 - (BOOL)textView:(NSTextView *)textView shouldChangeTextInRange:(NSRange)range
                                                replacementString:(NSString *)string {
     if (self.suppressTextViewCallbacks) return YES;
-    // Only allow deletions (empty replacement string), not insertions
     if (string.length > 0) return NO;
     return NO; // Deletions handled by keyDown
 }

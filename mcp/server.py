@@ -1006,13 +1006,15 @@ def open_transcript(file_url: str = "") -> str:
 
 @mcp.tool()
 def get_transcript() -> str:
-    """Get the current transcript state, including all words with timestamps.
+    """Get the current transcript state, including all words with timestamps, speakers, and silences.
 
     Returns:
     - status: idle/transcribing/ready/error
     - wordCount: number of transcribed words
-    - text: full transcript text
-    - words: array of {index, text, startTime, endTime, duration, confidence}
+    - silenceCount: number of detected pauses/silences
+    - text: full transcript text (with segment headers and silence markers)
+    - words: array of {index, text, startTime, endTime, duration, confidence, speaker}
+    - silences: array of {startTime, endTime, duration, startTimecode, endTimecode}
     - progress: {completed, total} when transcribing
 
     Use this after open_transcript() to check when transcription is complete
@@ -1025,6 +1027,8 @@ def get_transcript() -> str:
     # Format nicely
     lines = [f"Status: {r.get('status', 'unknown')}"]
     lines.append(f"Words: {r.get('wordCount', 0)}")
+    lines.append(f"Silences: {r.get('silenceCount', 0)}")
+    lines.append(f"Silence threshold: {r.get('silenceThreshold', 0.3):.1f}s")
 
     if r.get('progress'):
         p = r['progress']
@@ -1036,12 +1040,19 @@ def get_transcript() -> str:
             text = text[:2000] + "..."
         lines.append(f"\nTranscript:\n{text}")
 
+    if r.get('silences'):
+        lines.append(f"\nSilences ({len(r['silences'])} pauses):")
+        for s in r['silences']:
+            lines.append(f"  {s.get('startTimecode', '?')} - {s.get('endTimecode', '?')} "
+                         f"({s['duration']:.1f}s) after word [{s.get('afterWordIndex', '?')}]")
+
     if r.get('words'):
         lines.append(f"\nWord list ({len(r['words'])} words):")
         for w in r['words']:
             conf = w.get('confidence', 0) * 100
+            speaker = w.get('speaker', 'Unknown')
             lines.append(f"  [{w['index']:3d}] {w['startTime']:7.2f}s - {w['endTime']:7.2f}s "
-                         f"({conf:3.0f}%) \"{w['text']}\"")
+                         f"({conf:3.0f}%) [{speaker}] \"{w['text']}\"")
 
     if r.get('error'):
         lines.append(f"\nError: {r['error']}")
@@ -1101,6 +1112,93 @@ def close_transcript() -> str:
     if _err(r):
         return f"Error: {r.get('error', r)}"
     return "Transcript panel closed."
+
+
+@mcp.tool()
+def search_transcript(query: str) -> str:
+    """Search the transcript for text or special keywords.
+
+    Args:
+        query: Search text to find in the transcript.
+               Special keywords: "pauses" or "silences" to find all detected pauses.
+
+    Returns matching words or silences with timestamps.
+    Also updates the UI to highlight matches.
+    """
+    r = bridge.call("transcript.search", query=query)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+
+    lines = [f"Query: {r.get('query', query)}"]
+    lines.append(f"Results: {r.get('resultCount', 0)}")
+
+    results = r.get("results", [])
+    for res in results:
+        if res.get("type") == "silence":
+            lines.append(f"  [Pause] {res['startTime']:.2f}s - {res['endTime']:.2f}s ({res['duration']:.1f}s)")
+        else:
+            lines.append(f"  [{res.get('index', '?'):3d}] {res['startTime']:.2f}s - {res['endTime']:.2f}s "
+                         f"({res.get('confidence', 0)*100:.0f}%) \"{res.get('text', '')}\"")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def delete_transcript_silences(min_duration: float = 0.0) -> str:
+    """Delete all detected silences/pauses from the timeline.
+
+    This performs batch ripple-deletes on all silence gaps, removing dead air
+    from the video. Silences are deleted from end to start to maintain accuracy.
+
+    Args:
+        min_duration: Minimum silence duration in seconds to delete. Default 0 = all silences.
+                      Use 0.5 to only delete pauses longer than half a second, etc.
+
+    Use timeline_action("undo") repeatedly to reverse.
+    """
+    r = bridge.call("transcript.deleteSilences", minDuration=min_duration)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+
+    lines = [f"Status: {r.get('status', 'unknown')}"]
+    lines.append(f"Deleted: {r.get('deletedCount', 0)}/{r.get('totalSilences', 0)} silences")
+    if r.get("lastError"):
+        lines.append(f"Last error: {r['lastError']}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def set_transcript_speaker(start_index: int, count: int, speaker: str) -> str:
+    """Assign a speaker name to a range of words in the transcript.
+
+    Args:
+        start_index: Index of the first word to label
+        count: Number of consecutive words to label
+        speaker: Speaker name (e.g., "Host", "Guest", "Speaker 1")
+
+    This updates the speaker labels in the transcript display.
+    """
+    r = bridge.call("transcript.setSpeaker", speaker=speaker, startIndex=start_index, count=count)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+    return _fmt(r)
+
+
+@mcp.tool()
+def set_silence_threshold(threshold: float) -> str:
+    """Set the minimum gap duration (seconds) to detect as a silence/pause.
+
+    Args:
+        threshold: Duration in seconds. Default is 0.3 (300ms).
+                   Lower values detect shorter pauses, higher values only long ones.
+
+    The transcript must be re-transcribed for changes to take effect.
+    """
+    r = bridge.call("transcript.setSilenceThreshold", threshold=threshold)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+    return _fmt(r)
 
 
 # ============================================================

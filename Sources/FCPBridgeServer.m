@@ -1614,6 +1614,55 @@ static NSDictionary *FCPBridge_handleTranscriptMoveWords(NSDictionary *params) {
     return result ?: @{@"error": @"Operation failed"};
 }
 
+static NSDictionary *FCPBridge_handleTranscriptSearch(NSDictionary *params) {
+    NSString *query = params[@"query"];
+    if (!query || query.length == 0) return @{@"error": @"query is required"};
+
+    return [[FCPTranscriptPanel sharedPanel] searchTranscript:query] ?: @{@"error": @"Search failed"};
+}
+
+static NSDictionary *FCPBridge_handleTranscriptDeleteSilences(NSDictionary *params) {
+    double minDuration = [params[@"minDuration"] doubleValue]; // 0 = delete all
+
+    __block NSDictionary *result = nil;
+    result = [[FCPTranscriptPanel sharedPanel] deleteSilencesLongerThan:minDuration];
+    return result ?: @{@"error": @"Operation failed"};
+}
+
+static NSDictionary *FCPBridge_handleTranscriptSetSilenceThreshold(NSDictionary *params) {
+    double threshold = [params[@"threshold"] doubleValue];
+    if (threshold <= 0) return @{@"error": @"threshold must be > 0"};
+
+    [FCPTranscriptPanel sharedPanel].silenceThreshold = threshold;
+    return @{@"status": @"ok", @"silenceThreshold": @(threshold)};
+}
+
+static NSDictionary *FCPBridge_handleTranscriptSetEngine(NSDictionary *params) {
+    NSString *engineName = params[@"engine"];
+    if (!engineName) return @{@"error": @"engine is required ('fcpNative' or 'appleSpeech')"};
+
+    FCPTranscriptPanel *panel = [FCPTranscriptPanel sharedPanel];
+    if ([engineName isEqualToString:@"fcpNative"]) {
+        panel.engine = FCPTranscriptEngineFCPNative;
+    } else if ([engineName isEqualToString:@"appleSpeech"]) {
+        panel.engine = FCPTranscriptEngineAppleSpeech;
+    } else {
+        return @{@"error": @"Unknown engine. Use 'fcpNative' or 'appleSpeech'"};
+    }
+    return @{@"status": @"ok", @"engine": engineName};
+}
+
+static NSDictionary *FCPBridge_handleTranscriptSetSpeaker(NSDictionary *params) {
+    NSString *speaker = params[@"speaker"];
+    NSUInteger startIndex = [params[@"startIndex"] unsignedIntegerValue];
+    NSUInteger count = [params[@"count"] unsignedIntegerValue];
+    if (!speaker || speaker.length == 0) return @{@"error": @"speaker name is required"};
+    if (count == 0) return @{@"error": @"count must be > 0"};
+
+    [[FCPTranscriptPanel sharedPanel] setSpeaker:speaker forWordsFrom:startIndex count:count];
+    return @{@"status": @"ok", @"speaker": speaker, @"startIndex": @(startIndex), @"count": @(count)};
+}
+
 #pragma mark - Scene Change Detection
 
 NSDictionary *FCPBridge_handleDetectSceneChanges(NSDictionary *params) {
@@ -2461,6 +2510,16 @@ static NSDictionary *FCPBridge_handleRequest(NSDictionary *request) {
         result = FCPBridge_handleTranscriptDeleteWords(params);
     } else if ([method isEqualToString:@"transcript.moveWords"]) {
         result = FCPBridge_handleTranscriptMoveWords(params);
+    } else if ([method isEqualToString:@"transcript.search"]) {
+        result = FCPBridge_handleTranscriptSearch(params);
+    } else if ([method isEqualToString:@"transcript.deleteSilences"]) {
+        result = FCPBridge_handleTranscriptDeleteSilences(params);
+    } else if ([method isEqualToString:@"transcript.setSilenceThreshold"]) {
+        result = FCPBridge_handleTranscriptSetSilenceThreshold(params);
+    } else if ([method isEqualToString:@"transcript.setSpeaker"]) {
+        result = FCPBridge_handleTranscriptSetSpeaker(params);
+    } else if ([method isEqualToString:@"transcript.setEngine"]) {
+        result = FCPBridge_handleTranscriptSetEngine(params);
     }
     // scene detection
     else if ([method isEqualToString:@"scene.detect"]) {
