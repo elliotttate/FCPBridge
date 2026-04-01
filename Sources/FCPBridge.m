@@ -16,8 +16,10 @@ static dispatch_queue_t sLogQueue = nil;
 static void FCPBridge_initLogging(void) {
     sLogQueue = dispatch_queue_create("com.fcpbridge.log", DISPATCH_QUEUE_SERIAL);
 
-    // Write to ~/Desktop/fcpbridge.log (outside sandbox via absolute path exception)
-    sLogPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop/fcpbridge.log"];
+    // Write to ~/Library/Logs/FCPBridge/fcpbridge.log
+    NSString *logDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/FCPBridge"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:nil];
+    sLogPath = [logDir stringByAppendingPathComponent:@"fcpbridge.log"];
 
     // Create or truncate the log file
     [[NSFileManager defaultManager] createFileAtPath:sLogPath contents:nil attributes:nil];
@@ -68,9 +70,10 @@ const char *FCPBridge_getSocketPath(void) {
     if (canWrite) {
         [[NSFileManager defaultManager] removeItemAtPath:testPath error:nil];
     } else {
-        // Fall back to app container
-        NSString *containerPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop/fcpbridge.sock"];
-        path = containerPath;
+        // Fall back to app-specific cache directory
+        NSString *cacheDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/FCPBridge"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
+        path = [cacheDir stringByAppendingPathComponent:@"fcpbridge.sock"];
         FCPBridge_log(@"Using fallback socket path: %@", path);
     }
 

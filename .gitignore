@@ -1,6 +1,38 @@
+# Build artifacts
 build/
 *.dylib
 *.o
-.DS_Store
+*.a
+.build/
+
+# Python
 __pycache__/
 *.pyc
+.env*
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+xcuserdata/
+
+# Keys and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+.credentials
+credentials.json
+
+# Swift packages
+Package.resolved
+
+# Release binaries (use GitHub Releases instead)
+patcher/FCPBridgePatcher-v*.zip

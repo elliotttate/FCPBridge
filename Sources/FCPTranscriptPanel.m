@@ -377,6 +377,7 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
 // Options menu
 @property (nonatomic, strong) NSPopUpButton *enginePopup;
+@property (nonatomic, copy) NSString *parakeetModelVersion; // "v3" (default, multilingual) or "v2" (English-optimized)
 
 // Speaker diarization (macOS 26+)
 @property (nonatomic, strong) NSButton *speakerDetectionCheckbox;
@@ -411,7 +412,8 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         _currentFilter = @"all";
         _silenceThreshold = 0.3; // 300ms default
         _frameRate = 24.0;
-        _engine = FCPTranscriptEngineWhisper; // Default to Parakeet (fastest, most accurate)
+        _engine = FCPTranscriptEngineParakeet; // Default to Parakeet (fastest, most accurate)
+        _parakeetModelVersion = @"v3"; // v3 = multilingual, v2 = English-optimized
         _lastPlayheadHighlightRange = NSMakeRange(NSNotFound, 0);
 
         [[NSNotificationCenter defaultCenter]
@@ -481,13 +483,13 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     // Engine selector
     self.enginePopup = [[NSPopUpButton alloc] init];
     self.enginePopup.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.enginePopup addItemsWithTitles:@[@"FCP Native", @"Apple Speech", @"Parakeet"]];
+    [self.enginePopup addItemsWithTitles:@[@"FCP Native", @"Apple Speech", @"Parakeet v3", @"Parakeet v2"]];
     self.enginePopup.target = self;
     self.enginePopup.action = @selector(engineChanged:);
     self.enginePopup.font = [NSFont systemFontOfSize:11];
     self.enginePopup.controlSize = NSControlSizeSmall;
     [self.enginePopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [self.enginePopup selectItemAtIndex:2]; // Default to Parakeet
+    [self.enginePopup selectItemAtIndex:2]; // Default to Parakeet v3
     [row1 addSubview:self.enginePopup];
 
     // Speaker detection checkbox
@@ -766,9 +768,15 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     if ([selected isEqualToString:@"Apple Speech"]) {
         self.engine = FCPTranscriptEngineAppleSpeech;
         FCPBridge_log(@"[Transcript] Engine switched to Apple Speech (SFSpeechRecognizer)");
-    } else if ([selected isEqualToString:@"Parakeet"]) {
-        self.engine = FCPTranscriptEngineWhisper;
-        FCPBridge_log(@"[Transcript] Engine switched to Parakeet (FluidAudio)");
+    } else if ([selected hasPrefix:@"Parakeet"]) {
+        self.engine = FCPTranscriptEngineParakeet;
+        if ([selected isEqualToString:@"Parakeet v2"]) {
+            self.parakeetModelVersion = @"v2";
+            FCPBridge_log(@"[Transcript] Engine switched to Parakeet v2 (English-optimized)");
+        } else {
+            self.parakeetModelVersion = @"v3";
+            FCPBridge_log(@"[Transcript] Engine switched to Parakeet v3 (Multilingual)");
+        }
     } else {
         self.engine = FCPTranscriptEngineFCPNative;
         FCPBridge_log(@"[Transcript] Engine switched to FCP Native (AASpeechAnalyzer)");
@@ -784,7 +792,7 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 - (void)updateSpeakerCheckboxState {
     BOOL macOS26 = FCPTranscript_isSpeakerDiarizationAvailable();
     BOOL isAppleSpeech = (self.engine == FCPTranscriptEngineAppleSpeech);
-    BOOL isParakeet = (self.engine == FCPTranscriptEngineWhisper);
+    BOOL isParakeet = (self.engine == FCPTranscriptEngineParakeet);
 
     if (isParakeet) {
         // Parakeet has built-in diarization via FluidAudio — always available
@@ -1134,8 +1142,8 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     });
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        if (self.engine == FCPTranscriptEngineFCPNative || self.engine == FCPTranscriptEngineWhisper) {
-            // FCP Native and Whisper don't need Apple speech authorization
+        if (self.engine == FCPTranscriptEngineFCPNative || self.engine == FCPTranscriptEngineParakeet) {
+            // FCP Native and Parakeet don't need Apple speech authorization
             [self performTimelineTranscription];
         } else {
             [self requestSpeechAuthorizationWithCompletion:^(BOOL authorized) {
@@ -1272,8 +1280,8 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 - (void)performTimelineTranscription {
     if (self.engine == FCPTranscriptEngineFCPNative) {
         [self performFCPNativeTranscription];
-    } else if (self.engine == FCPTranscriptEngineWhisper) {
-        [self performWhisperTranscription];
+    } else if (self.engine == FCPTranscriptEngineParakeet) {
+        [self performParakeetTranscription];
     } else {
         [self performAppleSpeechTranscription];
     }
@@ -1732,24 +1740,53 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
 
 #pragma mark - Parakeet Transcription (NVIDIA Parakeet TDT via CLI tool)
 
-- (NSString *)whisperTranscriberPath {
-    // Look in build directory first, then in the swift package build
+- (NSString *)parakeetTranscriberPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1. Inside the FCP framework bundle (deployed by patcher)
     NSString *buildDir = [[[NSBundle mainBundle] bundlePath]
         stringByAppendingPathComponent:@"Contents/Frameworks/FCPBridge.framework/Versions/A/Resources"];
-    NSString *builtPath = [buildDir stringByAppendingPathComponent:@"whisper-transcriber"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:builtPath]) return builtPath;
+    NSString *builtPath = [buildDir stringByAppendingPathComponent:@"parakeet-transcriber"];
+    if ([fm fileExistsAtPath:builtPath]) return builtPath;
 
-    // Check the FCPBridge source tree build output
-    NSString *srcPath = @"/Users/briantate/Documents/GitHub/FCPBridge/tools/whisper-transcriber/.build/release/whisper-transcriber";
-    if ([[NSFileManager defaultManager] fileExistsAtPath:srcPath]) return srcPath;
+    // 2. Common deploy directories (matching silence-detector pattern)
+    NSString *home = NSHomeDirectory();
+    NSArray *searchPaths = @[
+        [home stringByAppendingPathComponent:@"Desktop/FCPBridge/build/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"Documents/GitHub/FCPBridge/build/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"Desktop/FCPBridge/tools/parakeet-transcriber/.build/release/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"Documents/GitHub/FCPBridge/tools/parakeet-transcriber/.build/release/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"FCPBridge/tools/parakeet-transcriber/.build/release/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"Library/Caches/FCPBridge/tools/parakeet-transcriber/.build/release/parakeet-transcriber"],
+    ];
+    for (NSString *path in searchPaths) {
+        if ([fm fileExistsAtPath:path]) return path;
+    }
 
     return nil;
 }
 
-- (BOOL)buildWhisperTranscriberWithStatus:(void(^)(NSString *status))statusUpdate {
-    NSString *projectDir = @"/Users/briantate/Documents/GitHub/FCPBridge/tools/whisper-transcriber";
-    if (![[NSFileManager defaultManager] fileExistsAtPath:projectDir]) {
-        FCPBridge_log(@"[Transcript] Whisper transcriber project not found at %@", projectDir);
+- (NSString *)findParakeetTranscriberProjectDir {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *home = NSHomeDirectory();
+    NSArray *candidates = @[
+        [home stringByAppendingPathComponent:@"Documents/GitHub/FCPBridge/tools/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"Desktop/FCPBridge/tools/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"FCPBridge/tools/parakeet-transcriber"],
+        [home stringByAppendingPathComponent:@"Library/Caches/FCPBridge/tools/parakeet-transcriber"],
+    ];
+    for (NSString *path in candidates) {
+        if ([fm fileExistsAtPath:[path stringByAppendingPathComponent:@"Package.swift"]]) {
+            return path;
+        }
+    }
+    return nil;
+}
+
+- (BOOL)buildParakeetTranscriberWithStatus:(void(^)(NSString *status))statusUpdate {
+    NSString *projectDir = [self findParakeetTranscriberProjectDir];
+    if (!projectDir) {
+        FCPBridge_log(@"[Transcript] Parakeet transcriber project not found in any known location");
         return NO;
     }
 
@@ -1777,39 +1814,39 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     NSString *output = [[NSString alloc] initWithData:outputData encoding:NSUTF8StringEncoding];
 
     if (task.terminationStatus != 0) {
-        FCPBridge_log(@"[Transcript] Whisper build failed (status %d): %@", task.terminationStatus, output);
+        FCPBridge_log(@"[Transcript] Parakeet build failed (status %d): %@", task.terminationStatus, output);
         return NO;
     }
 
-    FCPBridge_log(@"[Transcript] Whisper transcriber built successfully");
+    FCPBridge_log(@"[Transcript] Parakeet transcriber built successfully");
     return YES;
 }
 
-- (void)performWhisperTranscription {
+- (void)performParakeetTranscription {
     FCPBridge_log(@"[Transcript] Using Parakeet engine (FluidAudio)");
 
     // Check / build the CLI tool
-    NSString *binaryPath = [self whisperTranscriberPath];
+    NSString *binaryPath = [self parakeetTranscriberPath];
     if (!binaryPath) {
         __block BOOL buildOK = NO;
-        buildOK = [self buildWhisperTranscriberWithStatus:^(NSString *status) {
+        buildOK = [self buildParakeetTranscriberWithStatus:^(NSString *status) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self updateStatusUI:status];
                 self.progressBar.indeterminate = YES;
             });
         }];
         if (!buildOK) {
-            [self setErrorState:@"Failed to build Parakeet transcriber. Check tools/whisper-transcriber/."];
+            [self setErrorState:@"Failed to build Parakeet transcriber. Check tools/parakeet-transcriber/."];
             return;
         }
-        binaryPath = [self whisperTranscriberPath];
+        binaryPath = [self parakeetTranscriberPath];
         if (!binaryPath) {
             [self setErrorState:@"Parakeet transcriber binary not found after build."];
             return;
         }
     }
 
-    FCPBridge_log(@"[Transcript] Using whisper-transcriber at: %@", binaryPath);
+    FCPBridge_log(@"[Transcript] Using parakeet-transcriber at: %@", binaryPath);
 
     // Collect clips from timeline (reuse existing logic)
     __block NSArray *clips = nil;
@@ -1888,130 +1925,148 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         self.progressBar.doubleValue = 0;
     });
 
-    // Transcribe each clip via the CLI tool
-    NSUInteger totalClips = transcribableClips.count;
-    for (NSUInteger idx = 0; idx < totalClips; idx++) {
-        NSDictionary *clipInfo = transcribableClips[idx];
+    // Build batch manifest — deduplicate so each source file is transcribed only once
+    NSString *manifestPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"fcpbridge_batch.json"];
+    NSMutableOrderedSet *uniqueFiles = [NSMutableOrderedSet orderedSet];
+    for (NSDictionary *clipInfo in transcribableClips) {
         NSURL *mediaURL = clipInfo[@"mediaURL"];
-        double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
-        double trimStart = [clipInfo[@"trimStart"] doubleValue];
-        double clipDuration = [clipInfo[@"duration"] doubleValue];
-        NSString *clipHandle = clipInfo[@"handle"];
+        [uniqueFiles addObject:mediaURL.path];
+    }
+    NSMutableArray *manifestEntries = [NSMutableArray array];
+    for (NSString *file in uniqueFiles) {
+        [manifestEntries addObject:@{@"file": file}];
+    }
+    NSData *manifestData = [NSJSONSerialization dataWithJSONObject:manifestEntries options:0 error:nil];
+    [manifestData writeToFile:manifestPath atomically:YES];
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            double progress = (double)idx / MAX(totalClips, 1);
-            self.progressBar.doubleValue = progress;
-            [self updateStatusUI:[NSString stringWithFormat:@"Parakeet: clip %lu/%lu (%lu words)...",
-                (unsigned long)(idx + 1), (unsigned long)totalClips,
-                (unsigned long)self.mutableWords.count]];
-        });
+    FCPBridge_log(@"[Transcript] Parakeet batch: %lu clips, %lu unique files",
+        (unsigned long)transcribableClips.count, (unsigned long)uniqueFiles.count);
 
-        FCPBridge_log(@"[Transcript] Parakeet transcribing: %@ (timeline:%.2f, trim:%.2f, dur:%.2f)",
-            mediaURL.lastPathComponent, timelineStart, trimStart, clipDuration);
+    // Build arguments for batch mode
+    NSMutableArray *taskArgs = [NSMutableArray arrayWithObjects:@"--batch", manifestPath, @"--progress", nil];
+    if (self.speakerDetectionEnabled) {
+        [taskArgs addObject:@"--speakers"];
+    }
+    [taskArgs addObject:@"--model"];
+    [taskArgs addObject:self.parakeetModelVersion ?: @"v3"];
 
-        // Build arguments
-        NSMutableArray *taskArgs = [NSMutableArray arrayWithObjects:mediaURL.path, @"--progress", nil];
-        if (self.speakerDetectionEnabled) {
-            [taskArgs addObject:@"--speakers"];
-        }
+    // Run the CLI tool with streaming stderr for progress
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = binaryPath;
+    task.arguments = taskArgs;
 
-        // Run the CLI tool with streaming stderr for progress
-        NSTask *task = [[NSTask alloc] init];
-        task.launchPath = binaryPath;
-        task.arguments = taskArgs;
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    NSPipe *stderrPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = stderrPipe;
 
-        NSPipe *stdoutPipe = [NSPipe pipe];
-        NSPipe *stderrPipe = [NSPipe pipe];
-        task.standardOutput = stdoutPipe;
-        task.standardError = stderrPipe;
-
-        // Read stdout asynchronously to prevent pipe buffer deadlock
-        // (large JSON output can exceed the 64KB pipe buffer)
-        __block NSMutableData *stdoutAccum = [NSMutableData data];
-        stdoutPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-            NSData *data = handle.availableData;
-            if (data.length > 0) {
-                @synchronized (stdoutAccum) {
-                    [stdoutAccum appendData:data];
-                }
+    // Read stdout asynchronously to prevent pipe buffer deadlock
+    __block NSMutableData *stdoutAccum = [NSMutableData data];
+    stdoutPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *data = handle.availableData;
+        if (data.length > 0) {
+            @synchronized (stdoutAccum) {
+                [stdoutAccum appendData:data];
             }
-        };
-
-        // Read stderr asynchronously for live progress updates
-        __block NSMutableData *stderrAccum = [NSMutableData data];
-        stderrPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-            NSData *data = handle.availableData;
-            if (data.length == 0) return;
-            [stderrAccum appendData:data];
-
-            NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!text) return;
-
-            // Parse PROGRESS lines: "PROGRESS:0.5:message"
-            for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
-                if ([line hasPrefix:@"PROGRESS:"]) {
-                    NSArray *parts = [line componentsSeparatedByString:@":"];
-                    if (parts.count >= 3) {
-                        double frac = [parts[1] doubleValue];
-                        NSString *msg = [[parts subarrayWithRange:NSMakeRange(2, parts.count - 2)]
-                            componentsJoinedByString:@":"];
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            double clipProgress = (double)idx / MAX(totalClips, 1);
-                            double subProgress = frac / MAX(totalClips, 1);
-                            self.progressBar.indeterminate = NO;
-                            self.progressBar.doubleValue = clipProgress + subProgress;
-                            [self updateStatusUI:[NSString stringWithFormat:@"Parakeet %lu/%lu: %@",
-                                (unsigned long)(idx + 1), (unsigned long)totalClips, msg]];
-                        });
-                    }
-                } else if ([line hasPrefix:@"ERROR:"]) {
-                    FCPBridge_log(@"[Transcript] Parakeet stderr: %@", line);
-                }
-            }
-        };
-
-        @try {
-            [task launch];
-            [task waitUntilExit];
-        } @catch (NSException *e) {
-            FCPBridge_log(@"[Transcript] Parakeet task failed: %@", e.reason);
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil;
-            stderrPipe.fileHandleForReading.readabilityHandler = nil;
-            continue;
         }
+    };
 
-        // Stop handlers and drain remaining data
+    // Read stderr asynchronously for live progress updates
+    NSUInteger totalClips = transcribableClips.count;
+    stderrPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *data = handle.availableData;
+        if (data.length == 0) return;
+
+        NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (!text) return;
+
+        for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+            if ([line hasPrefix:@"PROGRESS:"]) {
+                NSArray *parts = [line componentsSeparatedByString:@":"];
+                if (parts.count >= 3) {
+                    double frac = [parts[1] doubleValue];
+                    NSString *msg = [[parts subarrayWithRange:NSMakeRange(2, parts.count - 2)]
+                        componentsJoinedByString:@":"];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.progressBar.indeterminate = NO;
+                        self.progressBar.doubleValue = frac;
+                        [self updateStatusUI:[NSString stringWithFormat:@"Parakeet: %@", msg]];
+                    });
+                }
+            } else if ([line hasPrefix:@"ERROR:"]) {
+                FCPBridge_log(@"[Transcript] Parakeet stderr: %@", line);
+            }
+        }
+    };
+
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *e) {
+        FCPBridge_log(@"[Transcript] Parakeet task failed: %@", e.reason);
         stdoutPipe.fileHandleForReading.readabilityHandler = nil;
         stderrPipe.fileHandleForReading.readabilityHandler = nil;
+        [self setErrorState:[NSString stringWithFormat:@"Parakeet failed: %@", e.reason]];
+        return;
+    }
 
-        // Read any remaining buffered data
-        NSData *remaining = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
-        if (remaining.length > 0) {
-            @synchronized (stdoutAccum) {
-                [stdoutAccum appendData:remaining];
-            }
-        }
+    stdoutPipe.fileHandleForReading.readabilityHandler = nil;
+    stderrPipe.fileHandleForReading.readabilityHandler = nil;
 
-        if (task.terminationStatus != 0) {
-            NSString *errStr = [[NSString alloc] initWithData:stderrAccum encoding:NSUTF8StringEncoding];
-            FCPBridge_log(@"[Transcript] Parakeet error for %@: %@", mediaURL.lastPathComponent, errStr);
-            continue;
-        }
-
-        // Parse JSON output
-        NSData *jsonData;
+    NSData *remaining = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
+    if (remaining.length > 0) {
         @synchronized (stdoutAccum) {
-            jsonData = [stdoutAccum copy];
+            [stdoutAccum appendData:remaining];
         }
-        NSArray *wordDicts = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+    }
 
-        if (![wordDicts isKindOfClass:[NSArray class]]) {
-            FCPBridge_log(@"[Transcript] Parakeet returned invalid JSON for %@", mediaURL.lastPathComponent);
-            continue;
+    // Clean up manifest
+    [[NSFileManager defaultManager] removeItemAtPath:manifestPath error:nil];
+
+    if (task.terminationStatus != 0) {
+        [self setErrorState:@"Parakeet transcription failed. Check ~/Library/Logs/FCPBridge/fcpbridge.log"];
+        return;
+    }
+
+    // Parse batch JSON output: [{"file":"path","words":[...]}, ...]
+    NSData *jsonData;
+    @synchronized (stdoutAccum) {
+        jsonData = [stdoutAccum copy];
+    }
+    NSArray *batchResults = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+
+    if (![batchResults isKindOfClass:[NSArray class]]) {
+        FCPBridge_log(@"[Transcript] Parakeet returned invalid batch JSON");
+        [self setErrorState:@"Parakeet returned invalid output."];
+        return;
+    }
+
+    // Map results back to clips by file path
+    NSMutableDictionary *resultsByFile = [NSMutableDictionary dictionary];
+    for (NSDictionary *result in batchResults) {
+        NSString *file = result[@"file"];
+        NSArray *words = result[@"words"];
+        if (file && [words isKindOfClass:[NSArray class]]) {
+            resultsByFile[file] = words;
         }
+    }
 
-        NSUInteger wordsAdded = 0;
-        @synchronized (self.mutableWords) {
+    // Process results for each clip
+    @synchronized (self.mutableWords) {
+        for (NSDictionary *clipInfo in transcribableClips) {
+            NSURL *mediaURL = clipInfo[@"mediaURL"];
+            double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
+            double trimStart = [clipInfo[@"trimStart"] doubleValue];
+            double clipDuration = [clipInfo[@"duration"] doubleValue];
+            NSString *clipHandle = clipInfo[@"handle"];
+
+            NSArray *wordDicts = resultsByFile[mediaURL.path];
+            if (!wordDicts) {
+                FCPBridge_log(@"[Transcript] No results for %@", mediaURL.lastPathComponent);
+                continue;
+            }
+
+            NSUInteger wordsAdded = 0;
             for (NSDictionary *wd in wordDicts) {
                 NSString *text = wd[@"word"];
                 double startTime = [wd[@"startTime"] doubleValue];
@@ -2019,7 +2074,6 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                 double confidence = [wd[@"confidence"] doubleValue];
                 NSString *speaker = wd[@"speaker"] ?: @"Unknown";
 
-                // Apply trim and timeline offset
                 if (startTime >= trimStart && startTime < trimStart + clipDuration) {
                     FCPTranscriptWord *word = [[FCPTranscriptWord alloc] init];
                     word.text = text;
@@ -2029,17 +2083,17 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
                     word.clipHandle = clipHandle;
                     word.clipTimelineStart = timelineStart;
                     word.sourceMediaOffset = trimStart;
-                    word.sourceMediaTime = startTime; // raw time in source file (immutable)
+                    word.sourceMediaTime = startTime;
                     word.sourceMediaPath = mediaURL.path;
                     word.speaker = speaker;
                     [self.mutableWords addObject:word];
                     wordsAdded++;
                 }
             }
-        }
 
-        FCPBridge_log(@"[Transcript] Parakeet got %lu words from %@",
-            (unsigned long)wordsAdded, mediaURL.lastPathComponent);
+            FCPBridge_log(@"[Transcript] Parakeet got %lu words from %@",
+                (unsigned long)wordsAdded, mediaURL.lastPathComponent);
+        }
     }
 
     // Finalize — sort, index, detect silences, build UI
@@ -2071,7 +2125,7 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
         [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses (Parakeet)",
             (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count]];
 
-        FCPBridge_log(@"[Transcript] Whisper transcription complete: %lu words, %lu silences",
+        FCPBridge_log(@"[Transcript] Parakeet transcription complete: %lu words, %lu silences",
             (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count);
     });
 }
@@ -3763,7 +3817,10 @@ static double CMTimeToSeconds(FCPTranscript_CMTime t) {
     state[@"silenceThreshold"] = @(self.silenceThreshold);
     state[@"frameRate"] = @(self.frameRate);
     state[@"engine"] = (self.engine == FCPTranscriptEngineFCPNative) ? @"fcpNative" :
-                       (self.engine == FCPTranscriptEngineWhisper) ? @"whisper" : @"appleSpeech";
+                       (self.engine == FCPTranscriptEngineParakeet) ? @"parakeet" : @"appleSpeech";
+    if (self.engine == FCPTranscriptEngineParakeet) {
+        state[@"parakeetModel"] = self.parakeetModelVersion ?: @"v3";
+    }
     state[@"speakerDetectionAvailable"] = @(FCPTranscript_isSpeakerDiarizationAvailable());
     state[@"speakerDetectionEnabled"] = @(self.speakerDetectionEnabled);
 

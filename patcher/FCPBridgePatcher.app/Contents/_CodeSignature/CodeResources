@@ -22,7 +22,7 @@
 		</data>
 		<key>Resources/Sources/FCPBridgeServer.m</key>
 		<data>
-		ThUsOtwTnDnIuR50zDCC+d9oyy8=
+		/pfg9y6YGNVHomFOpnVnuT1KS+4=
 		</data>
 		<key>Resources/Sources/FCPBridgeSwizzle.m</key>
 		<data>
@@ -34,19 +34,19 @@
 		</data>
 		<key>Resources/Sources/FCPCommandPalette.m</key>
 		<data>
-		W6eU9GX4o1d2/3aCFFwg8XRsUHE=
+		ZdGmLfQ0K+PQ3PWxAygpAn0P3wc=
 		</data>
 		<key>Resources/Sources/FCPTranscriptPanel.h</key>
 		<data>
-		ZgJwtMPsaqGZYFYaWGP7fqDZwzs=
+		EyY6VEOgSoQSjlSIUvHNFYJJscM=
 		</data>
 		<key>Resources/Sources/FCPTranscriptPanel.m</key>
 		<data>
-		npM/wAX/+QaLrNIgkwWa8dw4/jQ=
+		MjhwWLzbLijYIKm60OZ3upPC+QY=
 		</data>
 		<key>Resources/mcp/server.py</key>
 		<data>
-		aLAHs0CGRle3KwHErFstjq6T4+w=
+		+4jF9i8sk3gJCm2K8twtjrk6rgU=
 		</data>
 		<key>Resources/tools/silence-detector</key>
 		<data>
@@ -59,6 +59,15 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Frameworks/Sparkle.framework</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			pI/fD7Ot9g4CYCrerVUQWODaV6A=
+			</data>
+			<key>requirement</key>
+			<string>identifier "org.sparkle-project.Sparkle" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = RH4U5VJHM6</string>
+		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
 			<key>hash2</key>
@@ -91,7 +100,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			uMt2AaeEsD4QgEtywUFDYapZWGcyErG4xbkLlOQVJZc=
+			/LrGUDRVbe7/pjxhLbeUxoSj/3igq61df07Y+3IylTs=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPBridgeSwizzle.m</key>
@@ -112,28 +121,28 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			DavcODg8V5IVgWsLIMqcrVeY9+Kyjfocct/awMUyGzA=
+			GtsoS5gvkEvQegduGl2j82yH2K5oTWfMGgTOgPMY5Hw=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPTranscriptPanel.h</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			6Ey2imTnwUxnS5ejpV3LKBiZYDb3lrkAAPET8aTqf6E=
+			63Q6IntOdCKJfLQ2e+TOL7tG01chuxwIjQkWscmK3PM=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPTranscriptPanel.m</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			MgF/lEI8fXLvE0e78h7iqAxQqponp9lklk1bAKln/oM=
+			OR39CvWZae4qMCt4iQgvCnJ4rOU6mW0kOJ6FEqKDHlE=
 			</data>
 		</dict>
 		<key>Resources/mcp/server.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			aDit6KipuDg2/QoaKed29qGx5PlYO2h65bMbzr3PZiY=
+			NsqBpWQoh7RPUG4CwzzfmM2O8XQ0JF6oMLpFOLboxL4=
 			</data>
 		</dict>
 		<key>Resources/tools/silence-detector</key>

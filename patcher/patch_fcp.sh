@@ -433,7 +433,7 @@ ${BOLD}JSON-RPC server:${NC}
   127.0.0.1:$BRIDGE_PORT (starts automatically)
 
 ${BOLD}Check logs:${NC}
-  ~/Desktop/fcpbridge.log
+  ~/Library/Logs/FCPBridge/fcpbridge.log
 
 ${BOLD}Python client:${NC}
   python3 $REPO_DIR/Scripts/fcpbridge_client.py

@@ -167,7 +167,16 @@ set_silence_threshold(threshold=0.5)           # set minimum pause detection (se
 close_transcript()                             # close the panel
 ```
 
-The transcript panel opens inside FCP as a floating window:
+The transcript panel opens inside FCP as a floating window with an **engine selector dropdown**:
+- **Parakeet v3** (default) — NVIDIA Parakeet TDT 0.6B multilingual (25 languages), on-device via FluidAudio
+- **Parakeet v2** — English-optimized variant, same speed
+- **Apple Speech** — SFSpeechRecognizer (slower, network-capable)
+- **FCP Native** — Built-in AASpeechAnalyzer
+
+All clips are transcribed in a single batch process (model loaded once, reused across clips).
+Speaker diarization is available with Parakeet engines (checkbox in UI).
+
+Panel features:
 - Shows transcribed text grouped by **speaker segments** with timecode ranges (HH:MM:SS:FF)
 - **Silence markers** `[⋯]` shown inline between words where pauses are detected
 - Click a word to jump the playhead to that time

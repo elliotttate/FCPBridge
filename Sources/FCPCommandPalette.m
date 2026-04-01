@@ -367,6 +367,7 @@ static NSString * const kAIRowID = @"FCPAIRow";
     add(@"Export FCPXML", @"exportXML", @"timeline", FCPCommandCategoryExport, @"Export", nil, @"Export timeline as FCPXML", @[@"xml"]);
     add(@"Share Selection", @"shareSelection", @"timeline", FCPCommandCategoryExport, @"Export", nil, @"Share/export selected range", @[@"render"]);
     add(@"Auto Reframe", @"autoReframe", @"timeline", FCPCommandCategoryEffects, @"Effects", nil, @"Auto-reframe for different aspect ratios", @[@"crop", @"aspect"]);
+    add(@"Stabilize Subject", @"stabilize_subject", @"subject_stabilize", FCPCommandCategoryEffects, @"Effects", nil, @"Lock camera onto a subject — keeps it fixed while background moves", @[@"lock on", @"track", @"stabilize", @"pin", @"follow", @"steady"]);
 
     // --- Generators ---
     add(@"Add Generator", @"addVideoGenerator", @"timeline", FCPCommandCategoryEffects, @"Effects", nil, @"Add a video generator", @[@"background"]);
@@ -1049,6 +1050,20 @@ static NSString * const kAIRowID = @"FCPAIRow";
     } else if ([type isEqualToString:@"effect_apply_by_name"]) {
         extern NSDictionary *FCPBridge_handleEffectsApply(NSDictionary *params);
         result = FCPBridge_handleEffectsApply(@{@"name": action});
+    } else if ([type isEqualToString:@"subject_stabilize"]) {
+        // Run on background thread — tracking takes time
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            extern NSDictionary *FCPBridge_handleSubjectStabilize(NSDictionary *params);
+            NSDictionary *r = FCPBridge_handleSubjectStabilize(@{});
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (r[@"error"]) {
+                    FCPBridge_log(@"[Stabilize] Error: %@", r[@"error"]);
+                } else {
+                    FCPBridge_log(@"[Stabilize] Complete: %@ keyframes applied", r[@"keyframesApplied"]);
+                }
+            });
+        });
+        result = @{@"action": action, @"status": @"started"};
     } else if ([type isEqualToString:@"silence_options"]) {
         [self showSilenceOptionsPanel];
         result = @{@"action": action, @"status": @"started"};
@@ -1128,12 +1143,24 @@ static NSString * const kAIRowID = @"FCPAIRow";
 #pragma mark - Remove Silences
 
 - (NSString *)findSilenceDetector {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1. Inside the FCP framework bundle (deployed by patcher)
+    NSString *buildDir = [[[NSBundle mainBundle] bundlePath]
+        stringByAppendingPathComponent:@"Contents/Frameworks/FCPBridge.framework/Versions/A/Resources"];
+    NSString *builtPath = [buildDir stringByAppendingPathComponent:@"silence-detector"];
+    if ([fm isExecutableFileAtPath:builtPath]) return builtPath;
+
+    // 2. Common deploy directories
+    NSString *home = NSHomeDirectory();
     NSArray *paths = @[
-        [NSString stringWithFormat:@"%@/Desktop/FCPBridge/build/silence-detector", NSHomeDirectory()],
-        [NSString stringWithFormat:@"%@/Documents/GitHub/FCPBridge/build/silence-detector", NSHomeDirectory()],
+        [home stringByAppendingPathComponent:@"Desktop/FCPBridge/build/silence-detector"],
+        [home stringByAppendingPathComponent:@"Documents/GitHub/FCPBridge/build/silence-detector"],
+        [home stringByAppendingPathComponent:@"FCPBridge/build/silence-detector"],
+        [home stringByAppendingPathComponent:@"Library/Caches/FCPBridge/build/silence-detector"],
     ];
     for (NSString *p in paths) {
-        if ([[NSFileManager defaultManager] isExecutableFileAtPath:p]) return p;
+        if ([fm isExecutableFileAtPath:p]) return p;
     }
     return nil;
 }

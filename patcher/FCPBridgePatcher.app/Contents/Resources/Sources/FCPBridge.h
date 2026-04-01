@@ -11,13 +11,13 @@
 #import <objc/message.h>
 
 // Version
-#define FCPBRIDGE_VERSION "2.0.0"
+#define FCPBRIDGE_VERSION "2.5.0"
 #define FCPBRIDGE_MAX_HANDLES 2000
 
 // Socket path - resolve at runtime to handle sandbox
 const char *FCPBridge_getSocketPath(void);
 
-// Logging - writes to ~/Desktop/fcpbridge.log AND NSLog
+// Logging - writes to ~/Library/Logs/FCPBridge/fcpbridge.log AND NSLog
 void FCPBridge_log(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 
 #pragma mark - Runtime Utilities

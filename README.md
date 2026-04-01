@@ -10,6 +10,8 @@ Direct in-process control of Final Cut Pro via dylib injection. FCPBridge loads 
 
 > Click a word to jump the playhead. Select words and press Delete to remove video segments. Drag words to reorder clips. All changes apply directly to the FCP timeline.
 
+Powered by **NVIDIA Parakeet TDT 0.6B** (on-device via FluidAudio) with v3 multilingual (25 languages) as the default engine and v2 English-optimized as an option. Speaker diarization identifies who's speaking. All clips are transcribed in a single batch process for speed.
+
 ### Command Palette — Apple Intelligence for Final Cut Pro
 
 Hit **Cmd+Shift+P** inside the modded FCP to open a VS Code-style command palette with fuzzy search across 100+ editing actions. Type what you want to do in plain English and Apple Intelligence (on-device LLM via FoundationModels) translates your intent into editing actions.
@@ -170,7 +172,7 @@ codesign --force --sign - --entitlements entitlements.plist \
 ~/Desktop/FinalCutPro_Modded/"Final Cut Pro.app"/Contents/MacOS/"Final Cut Pro"
 ```
 
-Check `~/Desktop/fcpbridge.log` for startup messages. You should see:
+Check `~/Library/Logs/FCPBridge/fcpbridge.log` for startup messages. You should see:
 ```
 [FCPBridge] Control server listening on 127.0.0.1:9876
 ```
@@ -278,7 +280,8 @@ FCPBridge/
 │   ├── FCPCommandPalette.h    # Command palette header
 │   └── FCPCommandPalette.m    # Cmd+Shift+P palette with Apple Intelligence + 100 commands
 ├── tools/
-│   └── silence-detector.swift # Audio silence detection CLI (AVFoundation + vDSP)
+│   ├── silence-detector.swift       # Audio silence detection CLI (AVFoundation + vDSP)
+│   └── parakeet-transcriber/        # On-device speech-to-text CLI (NVIDIA Parakeet via FluidAudio)
 ├── Scripts/
 │   ├── fcpbridge_client.py    # Interactive Python REPL client
 │   └── launch.sh              # Launch helper script
@@ -288,7 +291,8 @@ FCPBridge/
 │   └── FCP_API_REFERENCE.md   # Full API reference for FCP internals
 ├── CLAUDE.md                  # Skill documentation for Claude
 ├── Makefile                   # Build, deploy, launch targets
-└── entitlements.plist         # Unsandboxed entitlements for re-signing
+├── entitlements.plist         # Unsandboxed entitlements for re-signing
+└── LICENSE                    # MIT License
 ```
 
 ## Is This Legal / Safe to Use?

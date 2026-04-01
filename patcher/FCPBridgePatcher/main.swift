@@ -167,7 +167,7 @@ class PatcherModel: ObservableObject {
                 if bridgeConnected {
                     appendLog("FCPBridge connected on port 9876")
                 } else {
-                    appendLog("Waiting for FCPBridge... (check ~/Desktop/fcpbridge.log)")
+                    appendLog("Waiting for FCPBridge... (check ~/Library/Logs/FCPBridge/fcpbridge.log)")
                 }
             }
         }
@@ -285,6 +285,22 @@ class PatcherModel: ObservableObject {
             }
         }
 
+        // Build parakeet-transcriber tool (Swift Package with FluidAudio dependency)
+        let parakeetPkgDir = repoDir + "/tools/parakeet-transcriber"
+        let parakeetBin = buildDir + "/parakeet-transcriber"
+        if FileManager.default.fileExists(atPath: parakeetPkgDir + "/Package.swift") {
+            await logAsync("Building Parakeet transcriber (may take a moment on first run)...")
+            let parakeetResult = shell("cd '\(parakeetPkgDir)' && swift build -c release 2>&1")
+            let parakeetBuilt = parakeetPkgDir + "/.build/release/parakeet-transcriber"
+            if FileManager.default.fileExists(atPath: parakeetBuilt) {
+                shell("cp '\(parakeetBuilt)' '\(parakeetBin)'")
+                await logAsync("Built Parakeet transcriber")
+            } else {
+                await logAsync("Warning: Parakeet transcriber build failed (transcription will use Apple Speech instead)")
+                await logAsync(String(parakeetResult.suffix(200)))
+            }
+        }
+
         await completeStepAsync(.buildDylib)
 
         // Step 4: Install framework
@@ -303,20 +319,30 @@ class PatcherModel: ObservableObject {
             <plist version="1.0"><dict>
             <key>CFBundleIdentifier</key><string>com.fcpbridge.FCPBridge</string>
             <key>CFBundleName</key><string>FCPBridge</string>
-            <key>CFBundleVersion</key><string>2.1.0</string>
+            <key>CFBundleVersion</key><string>2.5.0</string>
             <key>CFBundlePackageType</key><string>FMWK</string>
             <key>CFBundleExecutable</key><string>FCPBridge</string>
             </dict></plist>
             """
         try plist.write(toFile: fwDir + "/Versions/A/Resources/Info.plist", atomically: true, encoding: .utf8)
 
-        // Deploy silence-detector to a location the command palette can find
-        if FileManager.default.fileExists(atPath: silenceBin) {
-            let toolsDir = NSHomeDirectory() + "/Desktop/FCPBridge/build"
-            shell("mkdir -p '\(toolsDir)' && cp '\(silenceBin)' '\(toolsDir)/silence-detector'")
-            // Also try Documents/GitHub path
-            let toolsDir2 = NSHomeDirectory() + "/Documents/GitHub/FCPBridge/build"
-            shell("mkdir -p '\(toolsDir2)' && cp '\(silenceBin)' '\(toolsDir2)/silence-detector' 2>/dev/null")
+        // Deploy tools to locations the runtime code can find
+        let toolsDirs = [
+            NSHomeDirectory() + "/Desktop/FCPBridge/build",
+            NSHomeDirectory() + "/Documents/GitHub/FCPBridge/build",
+        ]
+        for toolsDir in toolsDirs {
+            shell("mkdir -p '\(toolsDir)'")
+            if FileManager.default.fileExists(atPath: silenceBin) {
+                shell("cp '\(silenceBin)' '\(toolsDir)/silence-detector'")
+            }
+            if FileManager.default.fileExists(atPath: parakeetBin) {
+                shell("cp '\(parakeetBin)' '\(toolsDir)/parakeet-transcriber'")
+            }
+        }
+        // Also deploy parakeet-transcriber into the framework Resources so it's found first
+        if FileManager.default.fileExists(atPath: parakeetBin) {
+            shell("cp '\(parakeetBin)' '\(fwDir)/Versions/A/Resources/parakeet-transcriber'")
         }
 
         await logAsync("Framework installed")

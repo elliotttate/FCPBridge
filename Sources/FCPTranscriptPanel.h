@@ -47,7 +47,7 @@ typedef NS_ENUM(NSInteger, FCPTranscriptStatus) {
 typedef NS_ENUM(NSInteger, FCPTranscriptEngine) {
     FCPTranscriptEngineFCPNative = 0,   // FCP's built-in AASpeechAnalyzer (fast, on-device)
     FCPTranscriptEngineAppleSpeech,     // SFSpeechRecognizer (slower, network-capable)
-    FCPTranscriptEngineWhisper,         // NVIDIA Parakeet TDT 0.6B v2 via FluidAudio (on-device, auto-downloads)
+    FCPTranscriptEngineParakeet,        // NVIDIA Parakeet TDT 0.6B via FluidAudio (on-device, auto-downloads)
 };
 
 @interface FCPTranscriptPanel : NSObject
