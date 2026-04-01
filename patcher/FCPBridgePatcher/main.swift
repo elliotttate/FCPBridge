@@ -87,7 +87,11 @@ class PatcherModel: ObservableObject {
             found = NSHomeDirectory() + "/Library/Caches/FCPBridge"
         }
         repoDir = found
-        checkStatus()
+        // Defer status check — shell() pumps the run loop via waitUntilExit,
+        // which crashes if called during SwiftUI view graph initialization.
+        DispatchQueue.main.async { [self] in
+            checkStatus()
+        }
     }
 
     func checkStatus() {
