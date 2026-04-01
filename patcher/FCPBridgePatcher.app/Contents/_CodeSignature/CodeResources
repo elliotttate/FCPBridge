@@ -10,11 +10,11 @@
 		</data>
 		<key>Resources/Sources/FCPBridge.h</key>
 		<data>
-		8T4SLRYqVvIDvDq0NmweGNrtovs=
+		XAU9mdRgBxVx2f4RJTl3PwSqkcw=
 		</data>
 		<key>Resources/Sources/FCPBridge.m</key>
 		<data>
-		p6H4Pg/UDAoofFrAEa+pgdp8Xio=
+		8nVbfxMtc4CJQFoBm6USCAUlnOE=
 		</data>
 		<key>Resources/Sources/FCPBridgeRuntime.m</key>
 		<data>
@@ -22,7 +22,7 @@
 		</data>
 		<key>Resources/Sources/FCPBridgeServer.m</key>
 		<data>
-		/pfg9y6YGNVHomFOpnVnuT1KS+4=
+		4cdSLIY35odDL40BVPkLbBpt7bU=
 		</data>
 		<key>Resources/Sources/FCPBridgeSwizzle.m</key>
 		<data>
@@ -34,15 +34,15 @@
 		</data>
 		<key>Resources/Sources/FCPCommandPalette.m</key>
 		<data>
-		ZdGmLfQ0K+PQ3PWxAygpAn0P3wc=
+		bu8XIXjH88mhUkprxx9V9xY4d78=
 		</data>
 		<key>Resources/Sources/FCPTranscriptPanel.h</key>
 		<data>
-		EyY6VEOgSoQSjlSIUvHNFYJJscM=
+		jOGkzTy7SMlYqgAvWeQW0sZuR1Y=
 		</data>
 		<key>Resources/Sources/FCPTranscriptPanel.m</key>
 		<data>
-		MjhwWLzbLijYIKm60OZ3upPC+QY=
+		3NpT+ujNsKtOakQZ7tJe25k8604=
 		</data>
 		<key>Resources/mcp/server.py</key>
 		<data>
@@ -79,14 +79,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			IIGRrMkiPYV/TRrzLhJbnnVvhDHmP0R7mIw5OuN7ljE=
+			wLPyRjPdAQp/x+VX7GOo9zWqzRN2JA9mF+jxQ7bbttI=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPBridge.m</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			zTJkvBo86Vqk6OgSpOvOV6Ba9OwDLDwM8/dfESvRtOw=
+			1GzdY1mW3NrW7uF6LjrwHplogHVRuHVz4VqFV4QvlxM=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPBridgeRuntime.m</key>
@@ -100,7 +100,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			/LrGUDRVbe7/pjxhLbeUxoSj/3igq61df07Y+3IylTs=
+			lcbaKM4l1biPfhPYukQxbYu89CijS/jofilX+GKxy7E=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPBridgeSwizzle.m</key>
@@ -121,21 +121,21 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			GtsoS5gvkEvQegduGl2j82yH2K5oTWfMGgTOgPMY5Hw=
+			g6HUbUV6w1tK8ZT0kISCsXr/ACXTbi418umVX/rhnB4=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPTranscriptPanel.h</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			63Q6IntOdCKJfLQ2e+TOL7tG01chuxwIjQkWscmK3PM=
+			LhRvOhYfotINn2W0FZEtuOtAZwURVp7W+/YAEqS3rok=
 			</data>
 		</dict>
 		<key>Resources/Sources/FCPTranscriptPanel.m</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			OR39CvWZae4qMCt4iQgvCnJ4rOU6mW0kOJ6FEqKDHlE=
+			bycWyV/htd0e7sBNzzYKjh4mFYM0zgzLkl1KlMLoGeM=
 			</data>
 		</dict>
 		<key>Resources/mcp/server.py</key>

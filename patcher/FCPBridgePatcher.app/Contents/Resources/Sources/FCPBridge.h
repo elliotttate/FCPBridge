@@ -11,7 +11,7 @@
 #import <objc/message.h>
 
 // Version
-#define FCPBRIDGE_VERSION "2.5.0"
+#define FCPBRIDGE_VERSION "2.6.0"
 #define FCPBRIDGE_MAX_HANDLES 2000
 
 // Socket path - resolve at runtime to handle sandbox

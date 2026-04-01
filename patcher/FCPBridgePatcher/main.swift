@@ -319,7 +319,7 @@ class PatcherModel: ObservableObject {
             <plist version="1.0"><dict>
             <key>CFBundleIdentifier</key><string>com.fcpbridge.FCPBridge</string>
             <key>CFBundleName</key><string>FCPBridge</string>
-            <key>CFBundleVersion</key><string>2.5.0</string>
+            <key>CFBundleVersion</key><string>2.6.0</string>
             <key>CFBundlePackageType</key><string>FMWK</string>
             <key>CFBundleExecutable</key><string>FCPBridge</string>
             </dict></plist>

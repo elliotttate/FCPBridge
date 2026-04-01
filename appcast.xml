@@ -6,6 +6,30 @@
     <description>FCPBridge Patcher release updates</description>
     <language>en</language>
     <item>
+      <title>FCPBridge v2.6.0 — Parakeet v3 Multilingual, Batch Transcription</title>
+      <sparkle:version>2.6.0</sparkle:version>
+      <sparkle:shortVersionString>2.6.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 01 Apr 2026 22:00:00 +0000</pubDate>
+      <description><![CDATA[
+        <h2>What's New in 2.6.0</h2>
+        <ul>
+          <li><b>Parakeet v3 Multilingual</b> — Default engine now supports 25 languages</li>
+          <li><b>Parakeet v2 English</b> — Available as dropdown option for English-optimized transcription</li>
+          <li><b>Batch Transcription</b> — Single process for all clips, ~2x faster on multi-clip timelines</li>
+          <li><b>Concurrent Diarization</b> — Speaker detection runs in parallel across files</li>
+          <li><b>Source Deduplication</b> — Clips from the same file transcribed only once</li>
+          <li><b>Installation Fix</b> — Parakeet now works for all users (removed hardcoded paths)</li>
+          <li><b>Project Cleanup</b> — Logs moved to ~/Library/Logs, added MIT license, .gitignore</li>
+        </ul>
+      ]]></description>
+      <enclosure
+        url="https://github.com/elliotttate/FCPBridge/releases/download/v2.6.0/FCPBridgePatcher-v2.6.0.zip"
+        sparkle:edSignature="hfanxljAVER2kF894o4QjaHG+axToURy8OicDbx+0ve85pbwyAYatAacesfwgkPpkEsKXFJ3Kp86/Lp9wCN8Cg=="
+        length="2320203"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>FCPBridge v2.5.0 — Parakeet, Speaker Diarization, Titles Fix, Auto-Update</title>
       <sparkle:version>2.5.0</sparkle:version>
       <sparkle:shortVersionString>2.5.0</sparkle:shortVersionString>
