@@ -10,6 +10,22 @@
       <sparkle:version>2.8.1</sparkle:version>
       <sparkle:shortVersionString>2.8.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 02 Apr 2026 16:27:18 +0000</pubDate>
+      <description><![CDATA[
+        <h2>What's New in 2.8.1</h2>
+        <p>Add 120+ commands to in-app command palette, fix Sparkle rpath for standalone launch</p>
+      ]]></description>
+      <enclosure
+        url="https://github.com/elliotttate/FCPBridge/releases/download/v2.8.1/FCPBridgePatcher-v2.8.1.zip"
+        sparkle:edSignature="Q96BXV73EIsB6FCfHQ2fM6eWLMcn8MpjXJQ/YbsWfsNN7x23hJO7Jmaa5fRFrGvEaDMbfJP3NHyBW5IhLY3dAQ=="
+        length="3102333"
+        type="application/octet-stream" />
+    </item>
+    <item>
+      <title>FCPBridge v2.8.1</title>
+      <sparkle:version>2.8.1</sparkle:version>
+      <sparkle:shortVersionString>2.8.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <pubDate>Thu, 02 Apr 2026 16:12:56 +0000</pubDate>
       <description><![CDATA[
         <h2>What's New in 2.8.1</h2>
