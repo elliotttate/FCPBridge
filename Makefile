@@ -24,6 +24,7 @@ FW_DIR = $(MODDED_APP)/Contents/Frameworks/SpliceKit.framework
 ENTITLEMENTS = entitlements.plist
 
 SILENCE_DETECTOR = $(BUILD_DIR)/silence-detector
+TOOLS_DIR = $(HOME)/Applications/SpliceKit/tools
 
 .PHONY: all clean deploy launch tools
 
@@ -61,6 +62,11 @@ deploy: $(OUTPUT) $(SILENCE_DETECTOR)
 		> "$(FW_DIR)/Versions/A/Resources/Info.plist"
 	@# Add speech recognition usage description for transcript feature
 	@/usr/libexec/PlistBuddy -c "Add :NSSpeechRecognitionUsageDescription string 'SpliceKit uses speech recognition to transcribe timeline audio for text-based editing.'" "$(MODDED_APP)/Contents/Info.plist" 2>/dev/null || true
+	@# Deploy tools
+	@mkdir -p "$(TOOLS_DIR)"
+	@cp $(SILENCE_DETECTOR) "$(TOOLS_DIR)/silence-detector" 2>/dev/null || true
+	@test -f tools/parakeet-transcriber/.build/release/parakeet-transcriber && \
+		cp tools/parakeet-transcriber/.build/release/parakeet-transcriber "$(TOOLS_DIR)/parakeet-transcriber" || true
 	@# Sign the framework
 	codesign --force --sign - "$(FW_DIR)"
 	@# Re-sign the app
