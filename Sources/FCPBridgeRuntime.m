@@ -45,7 +45,14 @@ void FCPBridge_executeOnMainThread(dispatch_block_t block) {
             dispatch_semaphore_signal(sem);
         });
         CFRunLoopWakeUp(CFRunLoopGetMain());
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        // Timeout after 20 seconds to prevent deadlocks when the main thread
+        // is stuck (e.g., loading CompressorKit during startup, modal dialogs).
+        long waitResult = dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC));
+        if (waitResult != 0) {
+            NSLog(@"[FCPBridge] WARNING: Main thread dispatch timed out (20s). "
+                  @"Main thread may be blocked by startup or modal dialog.");
+        }
     }
 }
 

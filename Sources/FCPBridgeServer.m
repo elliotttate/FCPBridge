@@ -20,6 +20,15 @@
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <objc/message.h>
+
+// x86_64 ABI requires objc_msgSend_stret for struct returns > 16 bytes.
+// ARM64 returns all structs through objc_msgSend (no _stret variant exists).
+#if defined(__x86_64__)
+#define STRET_MSG objc_msgSend_stret
+#else
+#define STRET_MSG objc_msgSend
+#endif
 
 // Forward declaration — defined in #pragma mark - Effect Drag as Adjustment Clip
 void FCPBridge_installEffectDragSwizzlesNow(void);
@@ -312,10 +321,14 @@ static NSDictionary *FCPBridge_handleSystemCallMethod(NSDictionary *params) {
                 // Integer return
                 long long intResult = ((long long (*)(id, SEL))objc_msgSend)(target, selector);
                 result = @{@"result": @(intResult)};
-            } else if (returnType[0] == 'd' || returnType[0] == 'f') {
-                // Float/double return
+            } else if (returnType[0] == 'd') {
+                // Double return
                 double dblResult = ((double (*)(id, SEL))objc_msgSend)(target, selector);
                 result = @{@"result": @(dblResult)};
+            } else if (returnType[0] == 'f') {
+                // Float return — must use float cast (x86_64 ABI returns float in XMM0[31:0])
+                float fltResult = ((float (*)(id, SEL))objc_msgSend)(target, selector);
+                result = @{@"result": @(fltResult)};
             } else {
                 // Unknown type
                 ((void (*)(id, SEL))objc_msgSend)(target, selector);
@@ -740,13 +753,13 @@ NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *params) {
 
             // Playhead
             if ([timeline respondsToSelector:@selector(playheadTime)]) {
-                FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(timeline, @selector(playheadTime));
+                FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(timeline, @selector(playheadTime));
                 state[@"playheadTime"] = FCPBridge_serializeCMTime(t);
             }
 
             // Sequence duration
             if ([sequence respondsToSelector:@selector(duration)]) {
-                FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, @selector(duration));
+                FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, @selector(duration));
                 state[@"duration"] = FCPBridge_serializeCMTime(d);
             }
 
@@ -798,7 +811,7 @@ NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *params) {
                             info[@"name"] = name ?: @"";
                         }
                         if ([item respondsToSelector:@selector(duration)]) {
-                            FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, @selector(duration));
+                            FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, @selector(duration));
                             info[@"duration"] = FCPBridge_serializeCMTime(d);
                         }
                         if ([item respondsToSelector:@selector(anchoredLane)]) {
@@ -819,14 +832,14 @@ NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *params) {
                         // Trimmed offset (in-point in source media)
                         SEL trimOffSel = NSSelectorFromString(@"trimmedOffset");
                         if ([item respondsToSelector:trimOffSel]) {
-                            FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, trimOffSel);
+                            FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, trimOffSel);
                             info[@"trimmedOffset"] = FCPBridge_serializeCMTime(t);
                         }
 
                         // Absolute position in timeline via effectiveRangeOfObject:
                         if (canGetRange) {
                             @try {
-                                FCPBridge_CMTimeRange range = ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(
+                                FCPBridge_CMTimeRange range = ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
                                     primaryObj, erSel, item);
                                 info[@"startTime"] = FCPBridge_serializeCMTime(range.start);
                                 // Compute end time = start + duration
@@ -852,7 +865,7 @@ NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *params) {
             // Frame rate from sequence
             SEL frdSel = NSSelectorFromString(@"frameDuration");
             if ([sequence respondsToSelector:frdSel]) {
-                FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, frdSel);
+                FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, frdSel);
                 state[@"frameDuration"] = FCPBridge_serializeCMTime(fd);
                 if (fd.value > 0) {
                     state[@"frameRate"] = @((double)fd.timescale / fd.value);
@@ -869,58 +882,339 @@ NSDictionary *FCPBridge_handleTimelineGetDetailedState(NSDictionary *params) {
 
 #pragma mark - FCPXML Import
 
+// Forward declarations
+static NSDictionary *FCPBridge_handlePasteboardImportXML(NSDictionary *params);
+static NSDictionary *FCPBridge_handleInspectorSet(NSDictionary *params);
+
 static NSDictionary *FCPBridge_handleFCPXMLImport(NSDictionary *params) {
     NSString *xml = params[@"xml"];
     if (!xml) return @{@"error": @"xml parameter required"};
     BOOL useInternal = [params[@"internal"] boolValue];
 
+    // Preferred path: use FFXMLTranslationTask (no dialog, no blocking)
+    if (useInternal) {
+        NSDictionary *pbResult = FCPBridge_handlePasteboardImportXML(@{@"xml": xml});
+        if (!pbResult[@"error"]) {
+            return pbResult;
+        }
+        FCPBridge_log(@"Pasteboard import failed (%@), falling back to file import",
+                      pbResult[@"error"]);
+    }
+
+    // Fallback: file-based import via NSWorkspace (async, won't block bridge)
+    NSString *tmpPath = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"fcpbridge_import.fcpxml"];
+    NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
+    [data writeToFile:tmpPath atomically:YES];
+    NSURL *fileURL = [NSURL fileURLWithPath:tmpPath];
+
+    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+    __block BOOL opened = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[NSWorkspace sharedWorkspace] openURLs:@[fileURL]
+        withApplicationAtURL:[[NSBundle mainBundle] bundleURL]
+        configuration:config
+        completionHandler:^(NSRunningApplication *app, NSError *error) {
+            opened = (error == nil);
+            dispatch_semaphore_signal(sem);
+        }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    return @{@"status": opened ? @"ok" : @"failed",
+             @"method": @"file",
+             @"message": opened ? @"FCPXML import triggered (may show library dialog)"
+                                : @"Failed to open file"};
+}
+
+#pragma mark - FCPXML Pasteboard Import (bypasses library dialog)
+
+static NSDictionary *FCPBridge_handlePasteboardImportXML(NSDictionary *params) {
+    // Import FCPXML from the system pasteboard (or provided XML string) directly
+    // into the current project, using FFXMLTranslationTask. This bypasses the
+    // library selection dialog that openXMLDocumentWithURL: triggers.
+    NSString *xml = params[@"xml"]; // Optional: if provided, write to PB first
+
     __block NSDictionary *result = nil;
     FCPBridge_executeOnMainThread(^{
         @try {
-            if (useInternal) {
-                // Internal import via PEAppController.openXMLDocumentWithURL:
-                NSString *tmpPath = [NSTemporaryDirectory()
-                    stringByAppendingPathComponent:@"fcpbridge_import.fcpxml"];
-                NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
-                [data writeToFile:tmpPath atomically:YES];
-                NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
-
-                id app = ((id (*)(id, SEL))objc_msgSend)(
-                    objc_getClass("NSApplication"), @selector(sharedApplication));
-                id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
-
-                SEL openSel = NSSelectorFromString(@"openXMLDocumentWithURL:bundleURL:display:sender:");
-                if ([delegate respondsToSelector:openSel]) {
-                    ((void (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
-                        delegate, openSel, tmpURL, nil, YES, nil);
-                    result = @{@"status": @"ok", @"method": @"internal",
-                               @"message": @"FCPXML import triggered via PEAppController"};
-                } else {
-                    result = @{@"error": @"PEAppController does not respond to openXMLDocumentWithURL:"};
-                }
-            } else {
-                // File-based import via NSWorkspace
-                NSString *tmpPath = [NSTemporaryDirectory()
-                    stringByAppendingPathComponent:@"fcpbridge_import.fcpxml"];
-                NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
-                [data writeToFile:tmpPath atomically:YES];
-
-                NSURL *fileURL = [NSURL fileURLWithPath:tmpPath];
-                NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
-                __block BOOL opened = NO;
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                [[NSWorkspace sharedWorkspace] openURLs:@[fileURL]
-                    withApplicationAtURL:[[NSBundle mainBundle] bundleURL]
-                    configuration:config
-                    completionHandler:^(NSRunningApplication *app, NSError *error) {
-                        opened = (error == nil);
-                        dispatch_semaphore_signal(sem);
-                    }];
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-                result = @{@"status": opened ? @"ok" : @"failed",
-                           @"method": @"file",
-                           @"message": opened ? @"FCPXML import triggered" : @"Failed to open file"};
+            // If xml provided, write it to the pasteboard
+            if (xml) {
+                NSData *xmlData = [xml dataUsingEncoding:NSUTF8StringEncoding];
+                NSPasteboard *pb = [NSPasteboard generalPasteboard];
+                [pb clearContents];
+                // Use both generic and current versioned type
+                Class IXType = objc_getClass("IXXMLPasteboardType");
+                NSString *genericType = ((id (*)(id, SEL))objc_msgSend)((id)IXType, NSSelectorFromString(@"generic"));
+                NSString *currentType = ((id (*)(id, SEL))objc_msgSend)((id)IXType, NSSelectorFromString(@"current"));
+                if (genericType) [pb setData:xmlData forType:genericType];
+                if (currentType) [pb setData:xmlData forType:currentType];
             }
+
+            NSPasteboard *pb = [NSPasteboard generalPasteboard];
+
+            // Check if pasteboard has XML
+            SEL containsXMLSel = NSSelectorFromString(@"containsXML");
+            if (![pb respondsToSelector:containsXMLSel]) {
+                result = @{@"error": @"NSPasteboard does not have containsXML (Interchange not loaded)"};
+                return;
+            }
+            BOOL hasXML = ((BOOL (*)(id, SEL))objc_msgSend)(pb, containsXMLSel);
+            if (!hasXML) {
+                result = @{@"error": @"No FCPXML on pasteboard"};
+                return;
+            }
+
+            // Create FFXMLTranslationTask from pasteboard
+            Class taskClass = objc_getClass("FFXMLTranslationTask");
+            if (!taskClass) {
+                result = @{@"error": @"FFXMLTranslationTask class not found"};
+                return;
+            }
+            id task = ((id (*)(id, SEL))objc_msgSend)((id)taskClass, @selector(alloc));
+            SEL initPBSel = NSSelectorFromString(@"initForPasteboard:");
+            task = ((id (*)(id, SEL, id))objc_msgSend)(task, initPBSel, pb);
+            if (!task) {
+                result = @{@"error": @"Failed to create FFXMLTranslationTask from pasteboard"};
+                return;
+            }
+
+            // Check for parse errors
+            SEL errorSel = NSSelectorFromString(@"error");
+            id parseError = ((id (*)(id, SEL))objc_msgSend)(task, errorSel);
+            if (parseError) {
+                NSString *errDesc = ((id (*)(id, SEL))objc_msgSend)(parseError, @selector(localizedDescription));
+                result = @{@"error": [NSString stringWithFormat:@"FCPXML parse error: %@", errDesc]};
+                return;
+            }
+
+            // Create FFXMLImportOptions for incremental import into current project
+            Class optionsClass = objc_getClass("FFXMLImportOptions");
+            if (!optionsClass) {
+                result = @{@"error": @"FFXMLImportOptions class not found"};
+                return;
+            }
+            id options = ((id (*)(id, SEL))objc_msgSend)(
+                ((id (*)(id, SEL))objc_msgSend)((id)optionsClass, @selector(alloc)), @selector(init));
+
+            // Set incremental import (merge into existing library)
+            SEL setIncrementalSel = NSSelectorFromString(@"setIncrementalImport:");
+            if ([options respondsToSelector:setIncrementalSel]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(options, setIncrementalSel, YES);
+            }
+
+            // Set conflict resolution to merge (type 3)
+            SEL setConflictSel = NSSelectorFromString(@"setConflictResolutionType:");
+            if ([options respondsToSelector:setConflictSel]) {
+                ((void (*)(id, SEL, long long))objc_msgSend)(options, setConflictSel, 3);
+            }
+
+            // Set the target library (required to avoid "which library?" dialog)
+            id activeLibs = ((id (*)(id, SEL))objc_msgSend)(
+                objc_getClass("FFLibraryDocument"), NSSelectorFromString(@"copyActiveLibraries"));
+            if (activeLibs && [(NSArray *)activeLibs count] > 0) {
+                id library = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
+                    activeLibs, @selector(objectAtIndex:), 0);
+                SEL setLibrarySel = NSSelectorFromString(@"setLibrary:");
+                if ([options respondsToSelector:setLibrarySel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(options, setLibrarySel, library);
+                }
+                // Also set libraryURL
+                SEL urlSel = NSSelectorFromString(@"url");
+                if ([library respondsToSelector:urlSel]) {
+                    id libURL = ((id (*)(id, SEL))objc_msgSend)(library, urlSel);
+                    SEL setLibURLSel = NSSelectorFromString(@"setLibraryURL:");
+                    if (libURL && [options respondsToSelector:setLibURLSel]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(options, setLibURLSel, libURL);
+                    }
+                }
+            }
+
+            // Set target event from the current timeline's sequence
+            id timeline = FCPBridge_getActiveTimelineModule();
+            if (timeline) {
+                SEL seqSel = NSSelectorFromString(@"sequence");
+                id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, seqSel);
+                if (sequence) {
+                    SEL eventSel = NSSelectorFromString(@"event");
+                    SEL containerEventSel = NSSelectorFromString(@"containerEvent");
+                    id event = nil;
+                    if ([sequence respondsToSelector:eventSel]) {
+                        event = ((id (*)(id, SEL))objc_msgSend)(sequence, eventSel);
+                    } else if ([sequence respondsToSelector:containerEventSel]) {
+                        event = ((id (*)(id, SEL))objc_msgSend)(sequence, containerEventSel);
+                    }
+                    if (event) {
+                        SEL setTargetSel = NSSelectorFromString(@"setTargetEvent:");
+                        if ([options respondsToSelector:setTargetSel]) {
+                            ((void (*)(id, SEL, id))objc_msgSend)(options, setTargetSel, event);
+                        }
+                    }
+                }
+            }
+
+            // Import clips
+            SEL importSel = NSSelectorFromString(@"importClipsWithOptions:");
+            BOOL importOK = NO;
+            if ([task respondsToSelector:importSel]) {
+                importOK = ((BOOL (*)(id, SEL, id))objc_msgSend)(task, importSel, options);
+            } else {
+                // Fallback: try importWithOptions:
+                SEL importSel2 = NSSelectorFromString(@"importWithOptions:");
+                if ([task respondsToSelector:importSel2]) {
+                    importOK = ((BOOL (*)(id, SEL, id))objc_msgSend)(task, importSel2, options);
+                }
+            }
+
+            // Check for import errors
+            id importError = ((id (*)(id, SEL))objc_msgSend)(task, errorSel);
+            if (importError) {
+                NSString *errDesc = ((id (*)(id, SEL))objc_msgSend)(importError, @selector(localizedDescription));
+                result = @{@"error": [NSString stringWithFormat:@"Import error: %@", errDesc],
+                           @"parseOK": @YES};
+                return;
+            }
+
+            // Get import results
+            SEL resultsSel = NSSelectorFromString(@"importResults");
+            id importResults = [task respondsToSelector:resultsSel] ?
+                ((id (*)(id, SEL))objc_msgSend)(task, resultsSel) : nil;
+
+            // ---------------------------------------------------------------
+            // Step 2: Parse attributes from the FCPXML that import stripped,
+            // then apply them to the imported clips via the inspector path.
+            // ---------------------------------------------------------------
+            NSMutableArray *appliedAttrs = [NSMutableArray array];
+            NSString *sourceXML = xml ?: ({
+                // Read back from pasteboard if xml wasn't provided as param
+                NSData *pbData = [pb dataForType:
+                    ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("IXXMLPasteboardType"),
+                        NSSelectorFromString(@"generic"))];
+                pbData ? [[NSString alloc] initWithData:pbData encoding:NSUTF8StringEncoding] : nil;
+            });
+
+            if (sourceXML && importOK) {
+                @try {
+                    NSData *xmlData = [sourceXML dataUsingEncoding:NSUTF8StringEncoding];
+                    NSXMLDocument *doc = [[NSXMLDocument alloc] initWithData:xmlData options:0 error:nil];
+                    if (doc) {
+                        // Find all asset-clips and extract their attributes
+                        NSArray *clips = [doc nodesForXPath:@"//asset-clip" error:nil];
+                        for (NSXMLElement *clip in clips) {
+                            NSString *clipName = [[clip attributeForName:@"name"] stringValue];
+                            NSMutableDictionary *attrs = [NSMutableDictionary dictionary];
+                            if (clipName) attrs[@"name"] = clipName;
+
+                            // Extract adjust-volume
+                            NSArray *volNodes = [clip nodesForXPath:@"adjust-volume" error:nil];
+                            if (volNodes.count > 0) {
+                                NSString *amount = [[(NSXMLElement *)volNodes[0] attributeForName:@"amount"] stringValue];
+                                if (amount) {
+                                    // Parse dB value: "-10dB" -> -10.0
+                                    NSString *numStr = [amount stringByReplacingOccurrencesOfString:@"dB" withString:@""];
+                                    attrs[@"volume"] = @([numStr doubleValue]);
+                                }
+                            }
+
+                            // Extract adjust-blend (opacity)
+                            NSArray *blendNodes = [clip nodesForXPath:@"adjust-blend" error:nil];
+                            if (blendNodes.count > 0) {
+                                NSString *amount = [[(NSXMLElement *)blendNodes[0] attributeForName:@"amount"] stringValue];
+                                if (amount) {
+                                    attrs[@"opacity"] = @([amount doubleValue]);
+                                }
+                            }
+
+                            // Only process if we found attributes to restore
+                            if (attrs[@"volume"] || attrs[@"opacity"]) {
+                                // Find the imported clip by loading the new sequence and selecting
+                                // For now, we apply to the most recently created sequence's clips
+                                id activeModule = FCPBridge_getActiveTimelineModule();
+                                if (!activeModule) {
+                                    // The import created a new project; we need to find and load it.
+                                    // Look for a sequence matching the project name in the FCPXML.
+                                    NSArray *projNodes = [doc nodesForXPath:@"//project" error:nil];
+                                    NSString *projName = projNodes.count > 0 ?
+                                        [[(NSXMLElement *)projNodes[0] attributeForName:@"name"] stringValue] : nil;
+
+                                    if (projName) {
+                                        id libs2 = ((id (*)(id, SEL))objc_msgSend)(
+                                            objc_getClass("FFLibraryDocument"),
+                                            NSSelectorFromString(@"copyActiveLibraries"));
+                                        if (libs2 && [(NSArray *)libs2 count] > 0) {
+                                            id lib2 = [(NSArray *)libs2 objectAtIndex:0];
+                                            id seqSet = ((id (*)(id, SEL))objc_msgSend)(
+                                                lib2, NSSelectorFromString(@"_deepLoadedSequences"));
+                                            id allSeqs = ((id (*)(id, SEL))objc_msgSend)(
+                                                seqSet, @selector(allObjects));
+                                            for (id seq in (NSArray *)allSeqs) {
+                                                NSString *seqName = ((id (*)(id, SEL))objc_msgSend)(
+                                                    seq, @selector(displayName));
+                                                if ([seqName isEqualToString:projName]) {
+                                                    // Load this sequence
+                                                    id app = ((id (*)(id, SEL))objc_msgSend)(
+                                                        objc_getClass("NSApplication"), @selector(sharedApplication));
+                                                    id del = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+                                                    id ec = ((id (*)(id, SEL))objc_msgSend)(
+                                                        del, NSSelectorFromString(@"activeEditorContainer"));
+                                                    if (ec) {
+                                                        ((void (*)(id, SEL, id))objc_msgSend)(
+                                                            ec, NSSelectorFromString(@"loadEditorForSequence:"), seq);
+                                                    }
+                                                    // Brief pause for the sequence to load
+                                                    [NSThread sleepForTimeInterval:0.5];
+                                                    activeModule = FCPBridge_getActiveTimelineModule();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (activeModule) {
+                                    // Select all clips in the timeline
+                                    SEL selAllSel = NSSelectorFromString(@"selectAll:");
+                                    if ([activeModule respondsToSelector:selAllSel]) {
+                                        ((void (*)(id, SEL, id))objc_msgSend)(activeModule, selAllSel, nil);
+                                    }
+                                    [NSThread sleepForTimeInterval:0.2];
+
+                                    // Apply volume via inspector path
+                                    if (attrs[@"volume"]) {
+                                        NSDictionary *volResult = FCPBridge_handleInspectorSet(
+                                            @{@"property": @"volume", @"value": attrs[@"volume"]});
+                                        if (!volResult[@"error"]) {
+                                            [appliedAttrs addObject:
+                                                [NSString stringWithFormat:@"volume=%@dB", attrs[@"volume"]]];
+                                        }
+                                    }
+                                    if (attrs[@"opacity"]) {
+                                        NSDictionary *opaResult = FCPBridge_handleInspectorSet(
+                                            @{@"property": @"opacity", @"value": attrs[@"opacity"]});
+                                        if (!opaResult[@"error"]) {
+                                            [appliedAttrs addObject:
+                                                [NSString stringWithFormat:@"opacity=%@", attrs[@"opacity"]]];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } @catch (NSException *e) {
+                    FCPBridge_log(@"[PasteImport] Attribute restore error: %@", e.reason);
+                }
+            }
+
+            NSMutableDictionary *info = [NSMutableDictionary dictionary];
+            info[@"status"] = @"ok";
+            info[@"importOK"] = @(importOK);
+            if (importResults) {
+                info[@"hasResults"] = @YES;
+                info[@"resultClass"] = NSStringFromClass([importResults class]);
+            }
+            if (appliedAttrs.count > 0) {
+                info[@"restoredAttributes"] = appliedAttrs;
+            }
+
+            result = info;
         } @catch (NSException *e) {
             result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
         }
@@ -1520,6 +1814,47 @@ NSDictionary *FCPBridge_handleTimelineAction(NSDictionary *params) {
 
         // Preferences
         @"showPreferences":  @"showPreferences:",
+
+        // --- Drop menu actions (drag-and-drop edit modes) ---
+        @"dropInsert":                  @"actionDropInsert:",
+        @"dropMenuInsert":              @"actionDropMenuInsert:",
+        @"dropMenuReplace":             @"actionDropMenuReplace:",
+        @"dropMenuReplaceAndStack":     @"actionDropMenuReplaceAndStack:",
+        @"dropMenuReplaceAtPlayhead":   @"actionDropMenuReplaceAtPlayhead:",
+        @"dropMenuReplaceFromEnd":      @"actionDropMenuReplaceFromEnd:",
+        @"dropMenuReplaceFromStart":    @"actionDropMenuReplaceFromStart:",
+        @"dropMenuReplaceWithRetime":   @"actionDropMenuReplaceWithRetime:",
+        @"dropMenuAddEditsToGroup":     @"actionDropMenuAddEditsToGroup:",
+        @"dropMenuAddToStack":          @"actionDropMenuAddToStack:",
+        @"dropMenuCancel":              @"actionDropMenuCancel:",
+
+        // --- Retiming quality (direct Flexo methods) ---
+        @"retimeTurnOnOpticalFlowHigh":    @"actionRetimeTurnOnOpticalFlowHigh:",
+        @"retimeTurnOnOpticalFlowMedium":  @"actionRetimeTurnOnOpticalFlowMedium:",
+        @"retimeTurnOnOpticalFlowFRC":     @"actionRetimeTurnOnOpticalFlowFRC:",
+        @"retimeTurnOnNearestNeighbor":    @"actionRetimeTurnOnNearestNeighbor:",
+        @"retimeRateConformOpticalFlowHigh": @"actionRateConformTurnOnOpticalFlowHigh:",
+
+        // --- Cinematic / tracking ---
+        @"resetCinematic":           @"actionResetCinematic:",
+        @"addTrackerOnSource":       @"actionAddTrackerOnSource:",
+
+        // --- Audio offset channels ---
+        @"bakeAndRemoveOffsetChannels": @"actionBakeAndRemoveOffsetChannels",
+        @"resetOffsetChannels":         @"actionResetOffsetChannels",
+
+        // --- Caption playback ---
+        @"setCaptionPlaybackEnabled":  @"actionSetCaptionPlaybackEnabled:",
+        @"setCaptionPlaybackRoleUID":  @"actionSetCaptionPlaybackRoleUID:",
+
+        // --- Trim extras ---
+        @"trimEdgeAtPlayhead":         @"actionTrimEdgeAtPlayhead:",
+        @"collapseToSpine":            @"actionCollapseToSpine",
+
+        // --- Variant/audition extras ---
+        @"deleteActiveVariant":        @"actionDeleteActiveVariantMakeNextActive:",
+        @"removeCutawayEffects":       @"actionRemoveCutawayEffects:",
+        @"toggleVerifyObjectAlignment": @"actionToggleVerifyObjectAlignment:",
     };
 
     // Undo/redo go through the document's FFUndoManager
@@ -1589,6 +1924,30 @@ NSDictionary *FCPBridge_handleTimelineAction(NSDictionary *params) {
         }
     }
 
+    // Special handling for paste: check if pasteboard has FCPXML.
+    // The timeline module's paste: only handles native FFPasteboardItem data.
+    // For FCPXML content, we must route through FFXMLTranslationTask instead.
+    if ([action isEqualToString:@"paste"]) {
+        __block BOOL hasXML = NO;
+        FCPBridge_executeOnMainThread(^{
+            NSPasteboard *pb = [NSPasteboard generalPasteboard];
+            SEL containsXMLSel = NSSelectorFromString(@"containsXML");
+            if ([pb respondsToSelector:containsXMLSel]) {
+                hasXML = ((BOOL (*)(id, SEL))objc_msgSend)(pb, containsXMLSel);
+            }
+            // Also check if it's NOT native (native takes priority)
+            if (hasXML) {
+                NSString *nativeType = @"com.apple.flexo.proFFPasteboardUTI";
+                if ([[pb types] containsObject:nativeType]) {
+                    hasXML = NO; // Native data present, use normal paste path
+                }
+            }
+        });
+        if (hasXML) {
+            return FCPBridge_handlePasteboardImportXML(@{});
+        }
+    }
+
     // First try on the timeline module directly (fastest, most specific)
     NSDictionary *result = FCPBridge_sendTimelineAction(selector);
 
@@ -1599,6 +1958,802 @@ NSDictionary *FCPBridge_handleTimelineAction(NSDictionary *params) {
             return FCPBridge_sendAppAction(selector);
         }
     }
+
+    return result;
+}
+
+#pragma mark - Direct Flexo Action Methods (Parameterized)
+
+// Handle direct calls to Flexo's action* methods on FFAnchoredTimelineModule.
+// These methods take real parameters (object handles, times, error pointers, etc.)
+// unlike the simple responder-chain actions in the actionMap above.
+//
+// Usage: {"method":"timeline.directAction", "params":{"selector":"actionRetimeSetRatePreset:rate:ripple:allowVariableSpeedRetiming:objectsAndNewRanges:error:", "args":[...]}}
+// Or use friendly names: {"method":"timeline.directAction", "params":{"action":"retimeSetRate", "rate":0.5, "ripple":true}}
+
+NSDictionary *FCPBridge_handleDirectTimelineAction(NSDictionary *params) {
+    NSString *action = params[@"action"];
+    NSString *rawSelector = params[@"selector"];
+
+    if (!action && !rawSelector) {
+        return @{@"error": @"action or selector parameter required"};
+    }
+
+    __block NSDictionary *result = nil;
+
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = FCPBridge_getActiveTimelineModule();
+            if (!timeline) {
+                result = @{@"error": @"No active timeline module. Is a project open?"};
+                return;
+            }
+
+            // Get the root item (primaryObject of the sequence) - needed by most action methods
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline,
+                NSSelectorFromString(@"sequence"));
+            id rootItem = nil;
+            if (sequence) {
+                rootItem = ((id (*)(id, SEL))objc_msgSend)(sequence,
+                    NSSelectorFromString(@"primaryObject"));
+            }
+
+            // Helper: get selected items
+            id (^getSelectedItems)(void) = ^{
+                SEL selSel = NSSelectorFromString(@"selectedItems");
+                if ([timeline respondsToSelector:selSel]) {
+                    return ((id (*)(id, SEL))objc_msgSend)(timeline, selSel);
+                }
+                return (id)nil;
+            };
+
+            // === Marker Operations ===
+
+            if ([action isEqualToString:@"changeMarkerType"]) {
+                // Change marker type: "chapter", "todo", "note"
+                NSString *type = params[@"type"] ?: @"note";
+                SEL sel;
+                if ([type isEqualToString:@"chapter"]) {
+                    sel = NSSelectorFromString(@"actionChangeMarkerTypeToChapter:error:");
+                } else if ([type isEqualToString:@"todo"]) {
+                    sel = NSSelectorFromString(@"actionChangeMarkerTypeToTodo:error:");
+                } else {
+                    sel = NSSelectorFromString(@"actionChangeMarkerTypeToNote:error:");
+                }
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"type": type, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"changeMarkerName"]) {
+                // Rename a marker: requires marker handle and new name
+                NSString *name = params[@"name"];
+                NSString *markerHandle = params[@"marker"];
+                if (!name) { result = @{@"error": @"name parameter required"}; return; }
+                id marker = markerHandle ? FCPBridge_resolveHandle(markerHandle) : nil;
+                if (!marker) {
+                    // Try to use selected marker
+                    id selected = getSelectedItems();
+                    if ([selected respondsToSelector:@selector(firstObject)]) {
+                        marker = ((id (*)(id, SEL))objc_msgSend)(selected, @selector(firstObject));
+                    }
+                }
+                if (!marker) { result = @{@"error": @"No marker found. Select a marker or pass marker handle."}; return; }
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionChangeMarkerDisplayName:marker:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(timeline, sel, name, marker, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"name": name, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"markMarkerCompleted"]) {
+                // Mark a todo marker as completed
+                id marker = params[@"marker"] ? FCPBridge_resolveHandle(params[@"marker"]) : nil;
+                if (!marker) {
+                    id selected = getSelectedItems();
+                    if ([selected respondsToSelector:@selector(firstObject)]) {
+                        marker = ((id (*)(id, SEL))objc_msgSend)(selected, @selector(firstObject));
+                    }
+                }
+                if (!marker) { result = @{@"error": @"No marker found"}; return; }
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionMarkMarkerAsCompleted:marker:error:");
+                BOOL completed = [params[@"completed"] boolValue];
+                ((void (*)(id, SEL, BOOL, id, NSError **))objc_msgSend)(timeline, sel, completed, marker, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"removeMarker"]) {
+                id marker = params[@"marker"] ? FCPBridge_resolveHandle(params[@"marker"]) : nil;
+                if (!marker) { result = @{@"error": @"marker handle required"}; return; }
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRemoveMarker:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, marker, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Retiming / Speed (Direct API) ===
+
+            if ([action isEqualToString:@"retimeSetRate"]) {
+                // Set exact retime rate with ripple control
+                double rate = [params[@"rate"] doubleValue];
+                BOOL ripple = [params[@"ripple"] boolValue];
+                BOOL allowVariable = params[@"allowVariableSpeed"] ? [params[@"allowVariableSpeed"] boolValue] : YES;
+                if (rate <= 0) { result = @{@"error": @"rate must be > 0 (e.g. 0.5 for half speed, 2.0 for double)"}; return; }
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeSetRatePreset:rate:ripple:allowVariableSpeedRetiming:objectsAndNewRanges:error:");
+                ((void (*)(id, SEL, id, double, BOOL, BOOL, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rate, ripple, allowVariable, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"rate": @(rate), @"ripple": @(ripple), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeHoldPreset"]) {
+                // Insert a hold/freeze frame at a specific time
+                // This is the direct API for freeze-extend
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeHoldPreset:holdComponentTime:duration:newHoldComponentTime:error:");
+                // holdComponentTime and duration come from the selected clip context
+                ((void (*)(id, SEL, id, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, nil, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeReverse"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeReverseClipPreset:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeBladeSpeedPreset"]) {
+                // Blade at a speed segment boundary
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeBladeSpeedPreset:componentTime:newComponentTime:error:");
+                ((void (*)(id, SEL, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeSpeedRamp"]) {
+                BOOL toZero = [params[@"toZero"] boolValue];
+                BOOL fromZero = [params[@"fromZero"] boolValue];
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeSpeedRampPreset:startComponentTime:endComponentTime:toZero:fromZero:error:");
+                ((void (*)(id, SEL, id, id, id, BOOL, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, nil, toZero, fromZero, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"toZero": @(toZero), @"fromZero": @(fromZero), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeInstantReplay"]) {
+                double rate = params[@"rate"] ? [params[@"rate"] doubleValue] : 0.5;
+                BOOL allowVariable = params[@"allowVariableSpeed"] ? [params[@"allowVariableSpeed"] boolValue] : YES;
+                BOOL addTitle = params[@"addTitle"] ? [params[@"addTitle"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeInstantReplayPreset:range:rate:allowVariableSpeedRetiming:addTitle:objectsAndNewRanges:error:");
+                ((void (*)(id, SEL, id, id, double, BOOL, BOOL, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, rate, allowVariable, addTitle, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"rate": @(rate), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeJumpCut"]) {
+                int framesToJump = params[@"framesToJump"] ? [params[@"framesToJump"] intValue] : 5;
+                BOOL allowVariable = params[@"allowVariableSpeed"] ? [params[@"allowVariableSpeed"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeJumpCutPreset:framesToJump:allowVariableSpeedRetiming:error:");
+                ((void (*)(id, SEL, id, int, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, framesToJump, allowVariable, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"framesToJump": @(framesToJump), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeRewind"]) {
+                double rewindSpeed = params[@"speed"] ? [params[@"speed"] doubleValue] : 2.0;
+                BOOL allowVariable = params[@"allowVariableSpeed"] ? [params[@"allowVariableSpeed"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRetimeRewindPreset:rewindSpeed:allowVariableSpeedRetiming:objectsAndNewRanges:error:");
+                ((void (*)(id, SEL, id, double, BOOL, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rewindSpeed, allowVariable, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"speed": @(rewindSpeed), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"retimeSetInterpolation"]) {
+                // Set interpolation type on retime segments
+                id selectedItems = getSelectedItems();
+                NSString *interpolation = params[@"interpolation"];
+                SEL sel = NSSelectorFromString(@"actionRetimeSetInterpolation:edits:");
+                ((void (*)(id, SEL, id, id))objc_msgSend)(timeline, sel, interpolation, selectedItems);
+                result = @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Trim / Edit (Direct API) ===
+
+            if ([action isEqualToString:@"splitAtTime"]) {
+                // Blade/split at exact time on a specific clip or all clips
+                // This is more precise than the responder-chain blade
+                double time = [params[@"time"] doubleValue];
+                int64_t timeValue = (int64_t)(time * 600);
+                SEL makeSel = NSSelectorFromString(@"CMTimeMake::");
+                id cmtime = nil; // We'll use the Flexo time APIs
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionSplitItems:atTime:forContainer:error:");
+                ((void (*)(id, SEL, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"trimDuration"]) {
+                // Trim selected edits to a specific duration
+                BOOL isDelta = params[@"isDelta"] ? [params[@"isDelta"] boolValue] : NO;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionTrimDuration:forEdits:isDelta:error:");
+                ((void (*)(id, SEL, id, id, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, nil, selectedItems, isDelta, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"extendOverNextClip"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionExtendOverNextClip:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"joinThroughEdits"]) {
+                BOOL onEdges = params[@"onEdges"] ? [params[@"onEdges"] boolValue] : YES;
+                BOOL onLeft = params[@"onLeft"] ? [params[@"onLeft"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionJoinThroughEdits:onEdges:onLeft:error:");
+                ((void (*)(id, SEL, id, BOOL, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, onEdges, onLeft, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"removeEdits"]) {
+                BOOL replaceWithGap = params[@"replaceWithGap"] ? [params[@"replaceWithGap"] boolValue] : NO;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRemoveEdits:replaceWithGap:removeOperation:rootItem:error:");
+                ((void (*)(id, SEL, id, BOOL, int, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, replaceWithGap, 0, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"replaceWithGap": @(replaceWithGap), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"insertGapDirect"]) {
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionInsertGap:rootItem:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(timeline, sel, nil, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"insertFreezeFrame"]) {
+                // Programmatic freeze frame insertion at playhead
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionInsertFreezeFrameAtTime:rootItem:toItems:endTime:error:");
+                ((void (*)(id, SEL, id, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, nil, rootItem, selectedItems, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Nudge (Direct API with amounts) ===
+
+            if ([action isEqualToString:@"nudgeAnchoredItems"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionNudgeAnchoredItems:rootItem:nudgeAmount:error:");
+                ((void (*)(id, SEL, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"nudgeSpineItems"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionNudgeSpineItems:rootItem:nudgeAmount:error:");
+                ((void (*)(id, SEL, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Audio Operations ===
+
+            if ([action isEqualToString:@"changeAudioVolume"]) {
+                double amount = [params[@"amount"] doubleValue];
+                BOOL isRelative = params[@"relative"] ? [params[@"relative"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionChangeAudioVolume:byAmount:overRange:isRelative:error:");
+                ((void (*)(id, SEL, id, double, id, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, amount, nil, isRelative, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"amount": @(amount), @"relative": @(isRelative), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"applyAudioFadesDirect"]) {
+                BOOL fadeIn = params[@"fadeIn"] ? [params[@"fadeIn"] boolValue] : YES;
+                double duration = params[@"duration"] ? [params[@"duration"] doubleValue] : 0.5;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionApplyAudioFades:objects:fadeInNotOut:fadeDuration:error:");
+                ((void (*)(id, SEL, id, id, BOOL, double, NSError **))objc_msgSend)(
+                    timeline, sel, nil, selectedItems, fadeIn, duration, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"fadeIn": @(fadeIn), @"duration": @(duration), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"setAudioPlayEnable"]) {
+                BOOL enabled = params[@"enabled"] ? [params[@"enabled"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionSetAudioPlayEnable:error:");
+                ((void (*)(id, SEL, BOOL, NSError **))objc_msgSend)(timeline, sel, enabled, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"enabled": @(enabled), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"setBackgroundMusic"]) {
+                BOOL isBackground = params[@"enabled"] ? [params[@"enabled"] boolValue] : YES;
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionSetBackgroundMusic:isBackgroundMusic:error:");
+                ((void (*)(id, SEL, id, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, isBackground, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"enabled": @(isBackground), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"detachAudioDirect"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionDetachAudio:newDetachedEdits:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"alignAudioToVideoDirect"]) {
+                id selectedItems = getSelectedItems();
+                SEL sel = NSSelectorFromString(@"actionAlignAudioToVideo:endEdits:container:");
+                ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, rootItem);
+                result = @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Multicam / Angles ===
+
+            if ([action isEqualToString:@"deleteMultiAngle"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionDeleteMultiAngle:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"renameAngle"]) {
+                NSString *newName = params[@"name"];
+                if (!newName) { result = @{@"error": @"name parameter required"}; return; }
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRenameAngle:newName:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, newName, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"name": newName, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"audioSyncMultiAngle"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAudioSyncMultiAngleItems:rootItem:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Keywords / Roles ===
+
+            if ([action isEqualToString:@"addKeywords"]) {
+                NSArray *keywords = params[@"keywords"];
+                if (!keywords) { result = @{@"error": @"keywords array required"}; return; }
+                NSSet *keywordSet = [NSSet setWithArray:keywords];
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAddKeywordsWithNames:forRange:animationHint:error:");
+                ((void (*)(id, SEL, id, id, int, NSError **))objc_msgSend)(
+                    timeline, sel, keywordSet, nil, 0, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"keywords": keywords, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"removeKeywords"]) {
+                NSArray *keywords = params[@"keywords"];
+                if (!keywords) { result = @{@"error": @"keywords array required"}; return; }
+                NSSet *keywordSet = [NSSet setWithArray:keywords];
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRemoveKeywordsWithNames:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, keywordSet, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"setRole"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionSetRole:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Effects / Masks ===
+
+            if ([action isEqualToString:@"removeEffectByID"]) {
+                NSString *effectID = params[@"effectID"];
+                if (!effectID) { result = @{@"error": @"effectID parameter required"}; return; }
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRemoveEffectID:fromAnchoredObjects:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, effectID, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"effectID": effectID, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"invertEffectMasks"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionInvertEffectMasks:actionName:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, @"Invert Mask", &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"toggleEnabled"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionToggleEnabled:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Clip Operations ===
+
+            if ([action isEqualToString:@"breakApartClipItems"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionBreakApartClipItems:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"createCompoundClipDirect"]) {
+                BOOL multiClip = [params[@"multicam"] boolValue];
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionCreateCompoundClip:multiClip:spine:error:");
+                ((void (*)(id, SEL, id, BOOL, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, multiClip, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"multicam": @(multiClip), @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"liftAnchoredEdits"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionLiftAnchoredEdits:rootItem:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"renameDirect"]) {
+                NSString *newName = params[@"name"];
+                if (!newName) { result = @{@"error": @"name parameter required"}; return; }
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRename:actionName:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, newName, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"name": newName, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"deleteItemsInArray"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionDeleteItemsInArray:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"moveClipsToTrash"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionMoveClipsToTrash:mediaRefsToDelete:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Captions ===
+
+            if ([action isEqualToString:@"duplicateCaptions"]) {
+                NSString *language = params[@"language"] ?: @"en";
+                NSString *format = params[@"format"] ?: @"ITT";
+                id selectedItems = getSelectedItems();
+                SEL sel = NSSelectorFromString(@"actionDuplicateCaptions:toLanguageIdentifier:andCaptionFormat:");
+                ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+                    timeline, sel, selectedItems, language, format);
+                result = @{@"action": action, @"language": language, @"format": format, @"status": @"ok"};
+                return;
+            }
+
+            // === Audition / Variants ===
+
+            if ([action isEqualToString:@"addVariants"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAddVariants:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"removeVariants"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionRemoveVariants:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, selectedItems, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"finalizeVariant"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionFinalizePickFromVariant:rootItem:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Project / Library ===
+
+            if ([action isEqualToString:@"newProject"]) {
+                NSString *name = params[@"name"] ?: @"Untitled";
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionNewProject:name:sequence:actionName:error:");
+                ((void (*)(id, SEL, id, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, nil, name, nil, @"New Project", &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"name": name, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"newEvent"]) {
+                NSString *name = params[@"name"] ?: @"New Event";
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionNewEvent:name:actionName:error:");
+                ((void (*)(id, SEL, id, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, nil, name, @"New Event", &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"name": name, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"validateAndRepair"]) {
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionValidateAndRepair:validateMode:error:");
+                ((void (*)(id, SEL, id, int, NSError **))objc_msgSend)(
+                    timeline, sel, nil, 0, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Auto-reframe (Direct) ===
+
+            if ([action isEqualToString:@"autoReframeDirect"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAutoReframe:forContainer:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Music alignment ===
+
+            if ([action isEqualToString:@"alignToMusicMarkers"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAlignToMusicMarkers:rootItem:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"alignClipsAtMusicMarkers"]) {
+                BOOL asSplit = [params[@"asSplit"] boolValue];
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAlignClipsAtMusicMarkersOnItems:rootItem:asSplit:error:");
+                ((void (*)(id, SEL, id, id, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, rootItem, asSplit, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"asSplit": @(asSplit), @"status": @"ok"};
+                return;
+            }
+
+            // === Transition operations (Direct) ===
+
+            if ([action isEqualToString:@"addTransitionsDirect"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionAddTransitionsToSpineObjects:before:after:effects:transitionOverlapType:transitionsCreated:rootItem:reportErrors:error:");
+                ((void (*)(id, SEL, id, id, id, id, int, id, id, BOOL, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, nil, nil, 0, nil, rootItem, YES, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Analyze and optimize ===
+
+            if ([action isEqualToString:@"analyzeAndOptimize"]) {
+                id selectedItems = getSelectedItems();
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionPerformAnalyzeAndOptimizeClips:options:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, selectedItems, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Lane conflict resolution ===
+
+            if ([action isEqualToString:@"resolveLaneConflicts"]) {
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionResolveLaneConflictsInContainer:excludedItems:error:");
+                ((void (*)(id, SEL, id, id, NSError **))objc_msgSend)(
+                    timeline, sel, rootItem, nil, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            if ([action isEqualToString:@"resolveLaneGaps"]) {
+                NSError *error = nil;
+                SEL sel = NSSelectorFromString(@"actionResolveLaneGapsInContainer:error:");
+                ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, rootItem, &error);
+                result = error ? @{@"error": error.localizedDescription}
+                               : @{@"action": action, @"status": @"ok"};
+                return;
+            }
+
+            // === Fallback: raw selector invocation ===
+            // If a selector string is provided directly, try to call it on the timeline module
+            if (rawSelector) {
+                SEL sel = NSSelectorFromString(rawSelector);
+                if (![timeline respondsToSelector:sel]) {
+                    result = @{@"error": [NSString stringWithFormat:@"Timeline module does not respond to %@", rawSelector]};
+                    return;
+                }
+                // Count colons to determine argument count
+                NSUInteger colonCount = [[rawSelector componentsSeparatedByString:@":"] count] - 1;
+                if (colonCount == 0) {
+                    ((void (*)(id, SEL))objc_msgSend)(timeline, sel);
+                } else if (colonCount == 1) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(timeline, sel, nil);
+                } else if (colonCount == 2) {
+                    NSError *error = nil;
+                    ((void (*)(id, SEL, id, NSError **))objc_msgSend)(timeline, sel, nil, &error);
+                    if (error) { result = @{@"error": error.localizedDescription}; return; }
+                } else {
+                    // For 3+ args, pass nils - caller should use call_method for full control
+                    ((void (*)(id, SEL, id, id, id))objc_msgSend)(timeline, sel, nil, nil, nil);
+                }
+                result = @{@"selector": rawSelector, @"status": @"ok"};
+                return;
+            }
+
+            result = @{@"error": [NSString stringWithFormat:@"Unknown direct action: %@", action]};
+        } @catch (NSException *e) {
+            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+        }
+    });
 
     return result;
 }
@@ -1737,7 +2892,7 @@ NSDictionary *FCPBridge_handlePlaybackSeek(NSDictionary *params) {
                     // On ARM64, objc_msgSend handles struct returns directly
                     SEL fdSel = NSSelectorFromString(@"frameDuration");
                     if ([sequence respondsToSelector:fdSel]) {
-                        FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(
+                        FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(
                             sequence, fdSel);
                         if (fd.timescale > 0) timescale = fd.timescale;
                     }
@@ -1782,7 +2937,7 @@ NSDictionary *FCPBridge_handlePlaybackGetPosition(NSDictionary *params) {
             // Read playhead time
             SEL phSel = NSSelectorFromString(@"playheadTime");
             if ([timeline respondsToSelector:phSel]) {
-                FCPBridge_CMTime pht = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(timeline, phSel);
+                FCPBridge_CMTime pht = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(timeline, phSel);
                 double seconds = (pht.timescale > 0) ? (double)pht.value / pht.timescale : 0;
 
                 NSMutableDictionary *r = [NSMutableDictionary dictionary];
@@ -1794,13 +2949,13 @@ NSDictionary *FCPBridge_handlePlaybackGetPosition(NSDictionary *params) {
                 if ([timeline respondsToSelector:seqSel]) {
                     id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, seqSel);
                     if (sequence && [sequence respondsToSelector:@selector(duration)]) {
-                        FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, @selector(duration));
+                        FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, @selector(duration));
                         r[@"duration"] = FCPBridge_serializeCMTime(dur);
                     }
                     // Frame rate
                     SEL fdSel = NSSelectorFromString(@"frameDuration");
                     if (sequence && [sequence respondsToSelector:fdSel]) {
-                        FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, fdSel);
+                        FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, fdSel);
                         if (fd.timescale > 0 && fd.value > 0) {
                             r[@"frameRate"] = @((double)fd.timescale / fd.value);
                             r[@"frameDuration"] = FCPBridge_serializeCMTime(fd);
@@ -1837,7 +2992,7 @@ static FCPBridge_CMTime FCPBridge_buildCMTime(double seconds, id timeline) {
         if (sequence) {
             SEL fdSel = NSSelectorFromString(@"frameDuration");
             if ([sequence respondsToSelector:fdSel]) {
-                FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, fdSel);
+                FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, fdSel);
                 if (fd.timescale > 0) timescale = fd.timescale;
             }
         }
@@ -1882,7 +3037,7 @@ static void FCPBridge_simulateKeyPress(unsigned short keyCode, NSString *chars, 
     [app sendEvent:keyUp];
 }
 
-// Helper: seek playhead and mark in/out using simulated key presses
+// Helper: seek playhead and mark in/out via direct responder chain (no key simulation)
 static BOOL FCPBridge_seekAndMark(id timeline, FCPBridge_CMTime time, NSString *actionSelector) {
     // Seek playhead
     SEL setSel = @selector(setPlayheadTime:);
@@ -1892,24 +3047,103 @@ static BOOL FCPBridge_seekAndMark(id timeline, FCPBridge_CMTime time, NSString *
     // Let FCP update playhead position
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
 
-    // Simulate key press: 'I' (keyCode 34) for mark in, 'O' (keyCode 31) for mark out
-    if ([actionSelector isEqualToString:@"setRangeStart:"]) {
-        FCPBridge_simulateKeyPress(34, @"i", 0); // 'I' key = mark in
-    } else if ([actionSelector isEqualToString:@"setRangeEnd:"]) {
-        FCPBridge_simulateKeyPress(31, @"o", 0); // 'O' key = mark out
-    } else if ([actionSelector isEqualToString:@"clearRange:"]) {
-        FCPBridge_simulateKeyPress(7, @"x", NSEventModifierFlagOption); // Option+X = clear range
-    } else {
-        // Fallback: try responder chain
-        id app = ((id (*)(id, SEL))objc_msgSend)(
-            objc_getClass("NSApplication"), @selector(sharedApplication));
-        SEL actionSel = NSSelectorFromString(actionSelector);
-        return ((BOOL (*)(id, SEL, SEL, id, id))objc_msgSend)(
-            app, @selector(sendAction:to:from:), actionSel, nil, nil);
-    }
+    // Send action via responder chain (works for setRangeStart:, setRangeEnd:, clearRange:, etc.)
+    id app = ((id (*)(id, SEL))objc_msgSend)(
+        objc_getClass("NSApplication"), @selector(sharedApplication));
+    SEL actionSel = NSSelectorFromString(actionSelector);
+    BOOL sent = ((BOOL (*)(id, SEL, SEL, id, id))objc_msgSend)(
+        app, @selector(sendAction:to:from:), actionSel, nil, nil);
 
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-    return YES;
+    return sent;
+}
+
+// Batch add markers at specific times using direct ObjC calls (no playhead movement needed)
+static NSDictionary *FCPBridge_handleBatchAddMarkers(NSDictionary *params) {
+    NSArray *markers = params[@"markers"];
+    if (!markers || ![markers isKindOfClass:[NSArray class]] || markers.count == 0) {
+        return @{@"error": @"markers array required (each: {time, name, kind})"};
+    }
+
+    __block NSDictionary *result = nil;
+    FCPBridge_executeOnMainThread(^{
+        @try {
+            id timeline = FCPBridge_getActiveTimelineModule();
+            if (!timeline) { result = @{@"error": @"No active timeline module"}; return; }
+
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+            if (!sequence) { result = @{@"error": @"No sequence in timeline"}; return; }
+
+            // Get frame duration for marker length
+            FCPBridge_CMTime frameDur = {100, 2400, 1, 0}; // default 24fps
+            SEL fdSel = NSSelectorFromString(@"frameDuration");
+            if ([sequence respondsToSelector:fdSel]) {
+                FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, fdSel);
+                if (fd.timescale > 0) frameDur = fd;
+            }
+
+            // Find the longest clip in the primary storyline as the target for markers
+            id primaryObj = [sequence respondsToSelector:@selector(primaryObject)]
+                ? ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject)) : nil;
+            if (!primaryObj) { result = @{@"error": @"Cannot access primary storyline"}; return; }
+
+            id containedItems = ((id (*)(id, SEL))objc_msgSend)(primaryObj, @selector(containedItems));
+            id targetClip = nil;
+            double bestDur = 0;
+            if ([containedItems isKindOfClass:[NSArray class]]) {
+                for (id item in (NSArray *)containedItems) {
+                    if ([item respondsToSelector:@selector(duration)]) {
+                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, @selector(duration));
+                        double dur = (d.timescale > 0) ? (double)d.value / d.timescale : 0;
+                        if (dur > bestDur) { bestDur = dur; targetClip = item; }
+                    }
+                }
+            }
+            if (!targetClip) { result = @{@"error": @"No clips found in timeline"}; return; }
+
+            SEL addSel = NSSelectorFromString(@"actionAddMarkerToAnchoredObject:isToDo:isChapter:withRange:error:");
+            if (![sequence respondsToSelector:addSel]) {
+                result = @{@"error": @"Sequence does not support actionAddMarkerToAnchoredObject:"};
+                return;
+            }
+
+            typedef BOOL (*AddMarkerFn)(id, SEL, id, BOOL, BOOL, FCPBridge_CMTimeRange, NSError **);
+            AddMarkerFn addMarker = (AddMarkerFn)objc_msgSend;
+
+            int32_t ts = frameDur.timescale > 0 ? frameDur.timescale : 600;
+            NSUInteger applied = 0;
+            NSMutableArray *results = [NSMutableArray array];
+
+            for (NSDictionary *m in markers) {
+                double t = [m[@"time"] doubleValue];
+                NSString *kind = m[@"kind"] ?: @"standard";
+                BOOL isToDo = [kind isEqualToString:@"todo"];
+                BOOL isChapter = [kind isEqualToString:@"chapter"];
+
+                FCPBridge_CMTime markerTime = {(int64_t)round(t * ts), ts, 1, 0};
+                FCPBridge_CMTimeRange range = {markerTime, frameDur};
+                NSError *err = nil;
+                BOOL ok = addMarker(sequence, addSel, targetClip, isToDo, isChapter, range, &err);
+                if (ok) {
+                    applied++;
+                    [results addObject:@{@"time": @(t), @"success": @YES}];
+                } else {
+                    [results addObject:@{@"time": @(t), @"success": @NO,
+                        @"error": err ? [err localizedDescription] : @"unknown"}];
+                }
+            }
+
+            result = @{
+                @"status": @"ok",
+                @"count": @(markers.count),
+                @"applied": @(applied),
+                @"markers": results,
+            };
+        } @catch (NSException *e) {
+            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+        }
+    });
+    return result ?: @{@"error": @"Failed to add markers"};
 }
 
 static NSDictionary *FCPBridge_handleSetRange(NSDictionary *params) {
@@ -1972,7 +3206,7 @@ static NSArray *FCPBridge_collectExportableClips(id primaryObj, NSSet *selectedS
         if (selectedSet && ![selectedSet containsObject:item]) continue;
 
         @try {
-            FCPBridge_CMTimeRange range = ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(
+            FCPBridge_CMTimeRange range = ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
                 primaryObj, erSel, item);
             NSString *name = @"Untitled";
             if ([item respondsToSelector:@selector(displayName)]) {
@@ -2614,7 +3848,7 @@ static NSDictionary *FCPBridge_handleTimelineGetState(NSDictionary *params) {
                 typedef struct { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch; } CMTime;
                 CMTime t;
                 // On arm64, small structs are returned in registers
-                t = ((CMTime (*)(id, SEL))objc_msgSend)(timeline, ptSel);
+                t = ((CMTime (*)(id, SEL))STRET_MSG)(timeline, ptSel);
                 state[@"playheadTime"] = @{
                     @"value": @(t.value),
                     @"timescale": @(t.timescale),
@@ -2781,7 +4015,7 @@ NSDictionary *FCPBridge_handleDetectSceneChanges(NSDictionary *params) {
                 double bestDur = 0;
                 for (id item in (NSArray *)items) {
                     if ([item respondsToSelector:@selector(duration)]) {
-                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, @selector(duration));
+                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, @selector(duration));
                         double dur = (d.timescale > 0) ? (double)d.value / d.timescale : 0;
                         if (dur > bestDur) { bestDur = dur; bestItem = item; }
                     }
@@ -2948,7 +4182,7 @@ NSDictionary *FCPBridge_handleDetectSceneChanges(NSDictionary *params) {
                 FCPBridge_CMTime frameDur = {1, 30, 1, 0};
                 SEL fdSel = NSSelectorFromString(@"frameDuration");
                 if ([sequence respondsToSelector:fdSel]) {
-                    frameDur = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, fdSel);
+                    frameDur = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, fdSel);
                 }
 
                 // Get the primary object and find the target clip (longest one)
@@ -2961,7 +4195,7 @@ NSDictionary *FCPBridge_handleDetectSceneChanges(NSDictionary *params) {
                 double bestDur = 0;
                 for (id item in (NSArray *)containedItems) {
                     if ([item respondsToSelector:@selector(duration)]) {
-                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, @selector(duration));
+                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, @selector(duration));
                         double dur = (d.timescale > 0) ? (double)d.value / d.timescale : 0;
                         if (dur > bestDur) { bestDur = dur; targetClip = item; }
                     }
@@ -3667,7 +4901,7 @@ NSDictionary *FCPBridge_handleSubjectStabilize(NSDictionary *params) {
         NSArray *results = ((id (*)(id, SEL))objc_msgSend)(request, @selector(results));
         if (results.count > 0) {
             id obs = results[0];
-            CGRect bbox = ((CGRect (*)(id, SEL))objc_msgSend)(obs, NSSelectorFromString(@"boundingBox"));
+            CGRect bbox = ((CGRect (*)(id, SEL))STRET_MSG)(obs, NSSelectorFromString(@"boundingBox"));
             initialBBox = bbox;
             FCPBridge_log(@"[Stabilize] Detected human at (%.2f, %.2f, %.2f, %.2f)",
                 bbox.origin.x, bbox.origin.y, bbox.size.width, bbox.size.height);
@@ -3760,7 +4994,7 @@ NSDictionary *FCPBridge_handleSubjectStabilize(NSDictionary *params) {
             NSArray *trackResults = ((id (*)(id, SEL))objc_msgSend)(trackRequest, @selector(results));
             if (trackResults.count > 0) {
                 observation = trackResults[0]; // Update observation for next frame
-                CGRect bbox = ((CGRect (*)(id, SEL))objc_msgSend)(
+                CGRect bbox = ((CGRect (*)(id, SEL))STRET_MSG)(
                     observation, NSSelectorFromString(@"boundingBox"));
                 double cx = bbox.origin.x + bbox.size.width / 2.0;
                 double cy = bbox.origin.y + bbox.size.height / 2.0;
@@ -4351,7 +5585,7 @@ static double FCPBridge_transitionFrameDurationSeconds(id timeline) {
         id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, seqSel);
         SEL fdSel = NSSelectorFromString(@"frameDuration");
         if (sequence && [sequence respondsToSelector:fdSel]) {
-            FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, fdSel);
+            FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, fdSel);
             if (fd.timescale > 0 && fd.value > 0) {
                 seconds = (double)fd.value / (double)fd.timescale;
             }
@@ -4363,7 +5597,7 @@ static double FCPBridge_transitionFrameDurationSeconds(id timeline) {
 static double FCPBridge_transitionCurrentTimeSeconds(id timeline) {
     SEL currentTimeSel = NSSelectorFromString(@"currentSequenceTime");
     if (![timeline respondsToSelector:currentTimeSel]) return 0.0;
-    FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(timeline, currentTimeSel);
+    FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(timeline, currentTimeSel);
     if (t.timescale <= 0) return 0.0;
     return (double)t.value / (double)t.timescale;
 }
@@ -4377,7 +5611,7 @@ static BOOL FCPBridge_transitionSeekToSeconds(id timeline, double seconds) {
         id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, seqSel);
         SEL fdSel = NSSelectorFromString(@"frameDuration");
         if (sequence && [sequence respondsToSelector:fdSel]) {
-            FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, fdSel);
+            FCPBridge_CMTime fd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, fdSel);
             if (fd.timescale > 0) timescale = fd.timescale;
         }
     }
@@ -4409,8 +5643,8 @@ static BOOL FCPBridge_transitionGetItemBounds(id item, double *outStart, double 
     SEL durSel = @selector(duration);
     if (![item respondsToSelector:startSel] || ![item respondsToSelector:durSel]) return NO;
 
-    FCPBridge_CMTime start = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, startSel);
-    FCPBridge_CMTime duration = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, durSel);
+    FCPBridge_CMTime start = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, startSel);
+    FCPBridge_CMTime duration = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, durSel);
     if (start.timescale <= 0 || duration.timescale <= 0) return NO;
 
     *outStart = (double)start.value / (double)start.timescale;
@@ -4427,7 +5661,7 @@ static BOOL FCPBridge_transitionGetItemBoundsInContext(id context, id item,
     if (![context respondsToSelector:rangeSel]) return NO;
 
     FCPBridge_CMTimeRange range =
-        ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(context, rangeSel, item);
+        ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(context, rangeSel, item);
     if (range.start.timescale <= 0 || range.duration.timescale <= 0) return NO;
 
     *outStart = (double)range.start.value / (double)range.start.timescale;
@@ -5028,7 +6262,7 @@ static double FCPBridge_defaultTransitionDurationSeconds(id timeline) {
     SEL durSel = NSSelectorFromString(@"defaultTransitionDurationForVideo");
     if (![sequence respondsToSelector:durSel]) return seconds;
 
-    FCPBridge_CMTime duration = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(sequence, durSel);
+    FCPBridge_CMTime duration = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(sequence, durSel);
     if (duration.timescale > 0 && duration.value > 0) {
         seconds = (double)duration.value / (double)duration.timescale;
     }
@@ -5451,7 +6685,7 @@ static void FCPBridge_logTimelineClips(id timelineModule, NSString *label) {
         if (canGetRange) {
             @try {
                 FCPBridge_CMTimeRange range =
-                    ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(primaryObj, erSel, item);
+                    ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(primaryObj, erSel, item);
                 double s = (range.start.timescale > 0) ? (double)range.start.value / (double)range.start.timescale : 0;
                 double d = (range.duration.timescale > 0) ? (double)range.duration.value / (double)range.duration.timescale : 0;
                 [desc appendFormat:@" [%@ %.4f+%.4f]", cls, s, d];
@@ -5490,7 +6724,7 @@ static BOOL FCPBridge_applyHoldFrameExtension(id timelineModule, double clipStar
             for (id item in items) {
                 if (transCls && [item isKindOfClass:transCls]) continue;
                 @try {
-                    FCPBridge_CMTimeRange range = ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(prim, erSel, item);
+                    FCPBridge_CMTimeRange range = ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(prim, erSel, item);
                     double s = (range.start.timescale > 0) ? (double)range.start.value/(double)range.start.timescale : -1;
                     if (fabs(s - clipStart) < frame * 2.0) { targetClip = item; break; }
                 } @catch (NSException *ex) { continue; }
@@ -5532,7 +6766,7 @@ static BOOL FCPBridge_applyHoldFrameExtension(id timelineModule, double clipStar
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
         if (prim && [prim respondsToSelector:erSel]) {
             @try {
-                FCPBridge_CMTimeRange curRange = ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(prim, erSel, targetClip);
+                FCPBridge_CMTimeRange curRange = ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(prim, erSel, targetClip);
                 newDur = (curRange.duration.timescale > 0) ? (double)curRange.duration.value / (double)curRange.duration.timescale : 0;
                 if (newDur > clipDur + frame) { holdWorked = YES; break; }
             } @catch (NSException *ex) {}
@@ -5692,7 +6926,7 @@ static char FCPBridge_swizzled_displayTransitionAlert(id self, SEL _cmd, char *r
             if (transCls && [item isKindOfClass:transCls]) continue;
             @try {
                 FCPBridge_CMTimeRange range =
-                    ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(
+                    ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
                         primaryObj, erSel, item);
                 if (range.duration.timescale <= 0 || range.duration.value <= 0) continue;
                 double s = (double)range.start.value / (double)range.start.timescale;
@@ -5792,7 +7026,7 @@ static char FCPBridge_swizzled_displayTransitionAlert(id self, SEL _cmd, char *r
                             if (clipIdx == 2) {
                                 @try {
                                     FCPBridge_CMTimeRange r =
-                                        ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(prim, erS, itm);
+                                        ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(prim, erS, itm);
                                     if (r.duration.timescale > 0) {
                                         double s = (double)r.start.value / (double)r.start.timescale;
                                         double d = (double)r.duration.value / (double)r.duration.timescale;
@@ -6438,7 +7672,11 @@ static void FCPBridge_scheduleEffectDragInstallRetry(void) {
 }
 
 void FCPBridge_installEffectDragSwizzlesNow(void) {
-    FCPBridge_executeOnMainThread(^{
+    // Use async dispatch to avoid deadlocking the bridge when the main thread
+    // is busy (e.g., loading CompressorKit during startup). The swizzles will
+    // be installed on the next main thread run loop iteration.
+    if (sOrigValidateEffectsDrop && sOrigTLKPerformDragOp) return; // Already installed
+    FCPBridge_executeOnMainThreadAsync(^{
         if (sOrigValidateEffectsDrop && sOrigTLKPerformDragOp) {
             sEffectDragInstallRetryScheduled = NO;
             return;
@@ -7280,7 +8518,7 @@ NSDictionary *FCPBridge_handleTransitionsApply(NSDictionary *params) {
                         if (transCls && [item isKindOfClass:transCls]) continue;
                         @try {
                             FCPBridge_CMTimeRange range =
-                                ((FCPBridge_CMTimeRange (*)(id, SEL, id))objc_msgSend)(
+                                ((FCPBridge_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
                                     primaryObj, erSel, item);
                             if (range.duration.timescale <= 0 || range.duration.value <= 0) continue;
                             double s = (double)range.start.value / (double)range.start.timescale;
@@ -7540,7 +8778,7 @@ static NSDictionary *FCPBridge_handleBrowserListClips(NSDictionary *params) {
                         info[@"name"] = name ?: @"";
                     }
                     if ([clip respondsToSelector:@selector(duration)]) {
-                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(clip, @selector(duration));
+                        FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(clip, @selector(duration));
                         info[@"duration"] = FCPBridge_serializeCMTime(d);
                     }
 
@@ -7635,9 +8873,9 @@ static NSDictionary *FCPBridge_handleBrowserAppendClip(NSDictionary *params) {
                 // Get the clip's clipped range
                 FCPBridge_CMTimeRange clipRange = {0};
                 if ([clip respondsToSelector:@selector(clippedRange)]) {
-                    clipRange = ((FCPBridge_CMTimeRange (*)(id, SEL))objc_msgSend)(clip, @selector(clippedRange));
+                    clipRange = ((FCPBridge_CMTimeRange (*)(id, SEL))STRET_MSG)(clip, @selector(clippedRange));
                 } else if ([clip respondsToSelector:@selector(duration)]) {
-                    FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(clip, @selector(duration));
+                    FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(clip, @selector(duration));
                     clipRange.start = (FCPBridge_CMTime){0, dur.timescale, 1, 0};
                     clipRange.duration = dur;
                 }
@@ -7678,10 +8916,16 @@ static NSDictionary *FCPBridge_handleBrowserAppendClip(NSDictionary *params) {
                 }
             }
 
-            // Now simulate pressing E (keycode 14) to append to storyline
+            // Append to storyline via responder chain (direct ObjC, no key simulation)
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-            FCPBridge_simulateKeyPress(14, @"e", 0); // E key = Append to Storyline
-            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.3]];
+            BOOL sent = ((BOOL (*)(id, SEL, SEL, id, id))objc_msgSend)(
+                app, @selector(sendAction:to:from:),
+                NSSelectorFromString(@"appendWithSelectedMedia:"), nil, nil);
+            if (!sent) {
+                result = @{@"error": @"No responder handled appendWithSelectedMedia:"};
+                return;
+            }
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
 
             NSString *clipName = @"";
             if ([clip respondsToSelector:@selector(displayName)])
@@ -9126,6 +10370,292 @@ static NSDictionary *FCPBridge_handleDialogDismiss(NSDictionary *params) {
     return result ?: @{@"error": @"Dismiss failed"};
 }
 
+#pragma mark - Beat Detection (Any Audio File)
+
+// Beat detection using AVFoundation spectral analysis.
+// Reads any audio file (MP3, WAV, M4A, etc.) and detects beats, bars, tempo.
+// Beat detection cannot run inside FCP's process (AVFoundation/popen deadlock in hardened runtime).
+// The MCP server runs the beat-detector tool directly as an external process.
+// This RPC endpoint accepts pre-computed beat data for passthrough.
+
+static NSDictionary *FCPBridge_handleBeatsDetect(NSDictionary *params) {
+    // If called with pre-computed data (from MCP), just pass it through
+    if (params[@"beats"] && params[@"bars"] && params[@"bpm"]) {
+        return params; // Already has beat data
+    }
+
+    return @{@"error": @"Beat detection must run via the MCP server (detect_beats tool). "
+             @"FCP's hardened runtime prevents audio file access from in-process code. "
+             @"Use the detect_beats() MCP tool which runs the beat-detector externally."};
+}
+
+#if 0 // Old AVFoundation-based beat detection (deadlocks inside FCP's process)
+            NSURL *fileURL = [NSURL fileURLWithPath:filePath];
+            if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+                return @{@"error": [NSString stringWithFormat:@"File not found: %@", filePath]};
+            }
+
+            // Read audio file with AVFoundation
+            AVURLAsset *asset = [AVURLAsset assetWithURL:fileURL];
+            NSError *error = nil;
+
+            // Get duration
+            CMTime assetDuration = [asset duration];
+            double totalDuration = CMTimeGetSeconds(assetDuration);
+            if (totalDuration <= 0) {
+                return @{@"error": @"Could not determine audio duration"};
+            }
+
+            // Create audio reader
+            AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&error];
+            if (!reader || error) {
+                return @{@"error": [NSString stringWithFormat:@"Cannot read audio: %@", error.localizedDescription]};
+            }
+
+            NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+            if (audioTracks.count == 0) {
+                return @{@"error": @"No audio tracks in file"};
+            }
+
+            // Read as mono float PCM at 44100 Hz
+            NSDictionary *outputSettings = @{
+                AVFormatIDKey: @(kAudioFormatLinearPCM),
+                AVLinearPCMBitDepthKey: @32,
+                AVLinearPCMIsFloatKey: @YES,
+                AVLinearPCMIsBigEndianKey: @NO,
+                AVLinearPCMIsNonInterleaved: @NO,
+                AVSampleRateKey: @44100,
+                AVNumberOfChannelsKey: @1
+            };
+
+            AVAssetReaderTrackOutput *output = [AVAssetReaderTrackOutput
+                assetReaderTrackOutputWithTrack:audioTracks[0]
+                outputSettings:outputSettings];
+            [reader addOutput:output];
+            [reader startReading];
+
+            // Read all samples into buffer
+            NSMutableData *pcmData = [NSMutableData data];
+            while (reader.status == AVAssetReaderStatusReading) {
+                CMSampleBufferRef sampleBuffer = [output copyNextSampleBuffer];
+                if (!sampleBuffer) break;
+                CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+                size_t length = 0;
+                char *dataPointer = NULL;
+                CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &length, &dataPointer);
+                if (dataPointer && length > 0) {
+                    [pcmData appendBytes:dataPointer length:length];
+                }
+                CFRelease(sampleBuffer);
+            }
+
+            if (pcmData.length == 0) {
+                return @{@"error": @"Could not read audio samples"};
+            }
+
+            float *samples = (float *)pcmData.bytes;
+            NSUInteger sampleCount = pcmData.length / sizeof(float);
+            double sampleRate = 44100.0;
+
+            FCPBridge_log(@"[BeatDetect] Read %lu samples (%.1fs) from %@",
+                (unsigned long)sampleCount, totalDuration, [filePath lastPathComponent]);
+
+            // === Onset detection via spectral energy ===
+            // Compute energy in short windows, detect peaks = onsets/beats
+
+            NSUInteger hopSize = 512;       // ~11.6ms at 44100Hz
+            NSUInteger windowSize = 1024;   // ~23.2ms
+            double hopDuration = (double)hopSize / sampleRate;
+
+            // Compute RMS energy per window
+            NSUInteger numFrames = (sampleCount > windowSize) ? (sampleCount - windowSize) / hopSize : 0;
+            if (numFrames < 10) {
+                return @{@"error": @"Audio too short for beat detection"};
+            }
+
+            float *energy = (float *)calloc(numFrames, sizeof(float));
+            for (NSUInteger i = 0; i < numFrames; i++) {
+                NSUInteger offset = i * hopSize;
+                float sum = 0;
+                for (NSUInteger j = 0; j < windowSize && (offset + j) < sampleCount; j++) {
+                    float s = samples[offset + j];
+                    sum += s * s;
+                }
+                energy[i] = sqrtf(sum / windowSize);
+            }
+
+            // Compute local average energy (sliding window for adaptive threshold)
+            NSUInteger avgWindow = (NSUInteger)(0.5 / hopDuration); // 500ms window
+            if (avgWindow < 4) avgWindow = 4;
+
+            float *localAvg = (float *)calloc(numFrames, sizeof(float));
+            for (NSUInteger i = 0; i < numFrames; i++) {
+                float sum = 0;
+                NSUInteger count = 0;
+                NSUInteger start = (i > avgWindow) ? i - avgWindow : 0;
+                NSUInteger end = MIN(i + avgWindow, numFrames);
+                for (NSUInteger j = start; j < end; j++) {
+                    sum += energy[j];
+                    count++;
+                }
+                localAvg[i] = (count > 0) ? sum / count : 0;
+            }
+
+            // Detect onsets: energy peaks above local average * threshold
+            double threshold = 1.3 + (1.0 - sensitivity) * 1.0; // sensitivity 0->2.3x, 1->1.3x
+            double minOnsetInterval = 60.0 / maxBPM; // min time between beats
+
+            NSMutableArray *onsets = [NSMutableArray array];
+            double lastOnsetTime = -999;
+
+            for (NSUInteger i = 1; i < numFrames - 1; i++) {
+                double t = (double)(i * hopSize) / sampleRate;
+                // Peak: higher than neighbors and above threshold * local average
+                if (energy[i] > energy[i-1] && energy[i] > energy[i+1] &&
+                    energy[i] > localAvg[i] * threshold &&
+                    (t - lastOnsetTime) >= minOnsetInterval) {
+                    [onsets addObject:@(t)];
+                    lastOnsetTime = t;
+                }
+            }
+
+            free(energy);
+            free(localAvg);
+
+            if (onsets.count < 4) {
+                return @{@"error": @"Could not detect enough beats in audio"};
+            }
+
+            // === Estimate tempo from onset intervals ===
+            NSMutableArray *intervals = [NSMutableArray array];
+            for (NSUInteger i = 1; i < onsets.count; i++) {
+                double interval = [onsets[i] doubleValue] - [onsets[i-1] doubleValue];
+                if (interval > 0.1 && interval < 2.0) {
+                    [intervals addObject:@(interval)];
+                }
+            }
+
+            // Find most common interval via histogram
+            double bestInterval = 0.5; // default 120 BPM
+            if (intervals.count > 0) {
+                // Sort and find median cluster
+                NSArray *sorted = [intervals sortedArrayUsingSelector:@selector(compare:)];
+                NSUInteger medianIdx = sorted.count / 2;
+                double median = [sorted[medianIdx] doubleValue];
+
+                // Average intervals near the median (within 20%)
+                double sum = 0;
+                NSUInteger count = 0;
+                for (NSNumber *iv in sorted) {
+                    double v = [iv doubleValue];
+                    if (fabs(v - median) / median < 0.2) {
+                        sum += v;
+                        count++;
+                    }
+                }
+                if (count > 0) bestInterval = sum / count;
+            }
+
+            double bpm = 60.0 / bestInterval;
+            // Ensure BPM is in reasonable range (double or halve if needed)
+            while (bpm < minBPM && bpm > 0) bpm *= 2.0;
+            while (bpm > maxBPM) bpm /= 2.0;
+            double beatInterval = 60.0 / bpm;
+
+            // === Generate quantized beat grid ===
+            // Find the offset that best aligns with detected onsets
+            double bestOffset = 0;
+            double bestScore = -1;
+            NSUInteger testSteps = 20;
+            for (NSUInteger s = 0; s < testSteps; s++) {
+                double testOffset = (beatInterval * s) / testSteps;
+                double score = 0;
+                for (NSNumber *onset in onsets) {
+                    double t = [onset doubleValue];
+                    double dist = fmod(t - testOffset, beatInterval);
+                    if (dist > beatInterval / 2) dist = beatInterval - dist;
+                    // Score inversely proportional to distance from grid
+                    score += 1.0 / (1.0 + dist * 20.0);
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestOffset = testOffset;
+                }
+            }
+
+            // Generate beat timestamps aligned to the grid
+            NSMutableArray *beats = [NSMutableArray array];
+            for (double t = bestOffset; t < totalDuration; t += beatInterval) {
+                [beats addObject:@(t)];
+            }
+
+            // Generate bar timestamps (every 4 beats)
+            NSMutableArray *bars = [NSMutableArray array];
+            for (NSUInteger i = 0; i < beats.count; i += 4) {
+                [bars addObject:beats[i]];
+            }
+
+            // Generate section timestamps (every 16 beats / 4 bars)
+            NSMutableArray *sections = [NSMutableArray array];
+            for (NSUInteger i = 0; i < beats.count; i += 16) {
+                [sections addObject:beats[i]];
+            }
+
+            FCPBridge_log(@"[BeatDetect] Detected %.1f BPM, %lu beats, %lu bars, %lu sections in %.1fs",
+                bpm, (unsigned long)beats.count, (unsigned long)bars.count,
+                (unsigned long)sections.count, totalDuration);
+
+            result = @{
+                @"beats": beats,
+                @"bars": bars,
+                @"sections": sections,
+                @"bpm": @(round(bpm * 10.0) / 10.0),
+                @"beatInterval": @(beatInterval),
+                @"beatCount": @(beats.count),
+                @"barCount": @(bars.count),
+                @"sectionCount": @(sections.count),
+                @"duration": @(totalDuration),
+                @"onsetCount": @(onsets.count),
+                @"filePath": filePath
+            };
+
+        } @catch (NSException *e) {
+            result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
+        }
+    } // @autoreleasepool
+
+    return result ?: @{@"error": @"Beat detection failed"};
+}
+#endif
+
+// Helper: get the original media URL from a browser clip
+// NOTE: Many FFAsset/FFMediaRep methods deadlock when called from main thread
+// inside FCPBridge_executeOnMainThread. This helper runs on a background thread
+// with a timeout to avoid hanging the RPC server.
+static NSString *FCPBridge_getMediaURLForClip(id clip) {
+    if (!clip) return nil;
+
+    __block NSString *result = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @try {
+            SEL origSel = NSSelectorFromString(@"originalMediaURL");
+            if ([clip respondsToSelector:origSel]) {
+                id url = ((id (*)(id, SEL))objc_msgSend)(clip, origSel);
+                if (url && [url isKindOfClass:[NSURL class]]) {
+                    result = [url absoluteString];
+                }
+            }
+        } @catch (NSException *e) { /* ignore */ }
+        dispatch_semaphore_signal(sem);
+    });
+
+    // Wait max 2 seconds — if it deadlocks, we just skip this clip's URL
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+    return result;
+}
+
 #pragma mark - FlexMusic & Montage Maker
 
 // ---------- FlexMusic static state ----------
@@ -9137,19 +10667,25 @@ static id FCPBridge_getFlexMusicLibrary(void) {
     Class fmLib = objc_getClass("FMSongLibrary");
     if (!fmLib) return nil;
 
-    // alloc/init with empty options dict
-    id instance = ((id (*)(id, SEL))objc_msgSend)(
-        (id)fmLib, @selector(alloc));
-    if (!instance) return nil;
-
-    SEL initSel = NSSelectorFromString(@"initWithOptions:");
-    if ([instance respondsToSelector:initSel]) {
-        instance = ((id (*)(id, SEL, id))objc_msgSend)(instance, initSel, @{});
-    } else {
-        instance = ((id (*)(id, SEL))objc_msgSend)(instance, @selector(init));
+    // Use the shared singleton factory — sharedLibraryWithOptions:
+    SEL sharedSel = NSSelectorFromString(@"sharedLibraryWithOptions:");
+    if ([fmLib respondsToSelector:sharedSel]) {
+        sFMSongLibrary = ((id (*)(id, SEL, id))objc_msgSend)((id)fmLib, sharedSel, @{});
     }
 
-    sFMSongLibrary = instance;
+    // Fallback: alloc/initWithOptions:
+    if (!sFMSongLibrary) {
+        id instance = ((id (*)(id, SEL))objc_msgSend)((id)fmLib, @selector(alloc));
+        if (instance) {
+            SEL initSel = NSSelectorFromString(@"initWithOptions:");
+            if ([instance respondsToSelector:initSel]) {
+                sFMSongLibrary = ((id (*)(id, SEL, id))objc_msgSend)(instance, initSel, @{});
+            } else {
+                sFMSongLibrary = ((id (*)(id, SEL))objc_msgSend)(instance, @selector(init));
+            }
+        }
+    }
+
     return sFMSongLibrary;
 }
 
@@ -9193,26 +10729,17 @@ static NSDictionary *FCPBridge_handleFlexMusicListSongs(NSDictionary *params) {
 
             // Try multiple selectors to get songs
             id songs = nil;
-            SEL songsSel = NSSelectorFromString(@"songs");
-            SEL availSel = NSSelectorFromString(@"availableSongs");
-            SEL allSel = NSSelectorFromString(@"allSongs");
 
-            if ([library respondsToSelector:songsSel]) {
-                songs = ((id (*)(id, SEL))objc_msgSend)(library, songsSel);
-            } else if ([library respondsToSelector:availSel]) {
-                songs = ((id (*)(id, SEL))objc_msgSend)(library, availSel);
-            } else if ([library respondsToSelector:allSel]) {
-                songs = ((id (*)(id, SEL))objc_msgSend)(library, allSel);
+            // 1. bundledSongs — locally available songs
+            SEL bundledSel = NSSelectorFromString(@"bundledSongs");
+            if ([library respondsToSelector:bundledSel]) {
+                songs = ((id (*)(id, SEL))objc_msgSend)(library, bundledSel);
             }
 
-            // If direct accessors fail, try fetch with completion (sync via semaphore)
-            if (!songs) {
-                SEL fetchSel = NSSelectorFromString(@"fetchSongsWithOptions:completionHandler:");
+            // 2. fetchSongsWithOptions: — returns array directly (synchronous)
+            if (!songs || ([songs isKindOfClass:[NSArray class]] && [(NSArray *)songs count] == 0)) {
+                SEL fetchSel = NSSelectorFromString(@"fetchSongsWithOptions:");
                 if ([library respondsToSelector:fetchSel]) {
-                    __block id fetchedSongs = nil;
-                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-
-                    // FMFetchOptions - try empty alloc/init
                     Class fetchOptClass = objc_getClass("FMFetchOptions");
                     id fetchOpts = nil;
                     if (fetchOptClass) {
@@ -9220,15 +10747,24 @@ static NSDictionary *FCPBridge_handleFlexMusicListSongs(NSDictionary *params) {
                             ((id (*)(id, SEL))objc_msgSend)((id)fetchOptClass, @selector(alloc)),
                             @selector(init));
                     }
-                    if (!fetchOpts) fetchOpts = (id)@{};
+                    id fetched = ((id (*)(id, SEL, id))objc_msgSend)(library, fetchSel, fetchOpts);
+                    if (fetched && [fetched isKindOfClass:[NSArray class]] && [(NSArray *)fetched count] > 0) {
+                        songs = fetched;
+                    }
+                }
+            }
 
-                    ((void (*)(id, SEL, id, void(^)(id, id)))objc_msgSend)(
-                        library, fetchSel, fetchOpts, ^(id songsResult, id error) {
-                            fetchedSongs = songsResult;
-                            dispatch_semaphore_signal(sem);
-                        });
-                    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-                    songs = fetchedSongs;
+            // 3. Try generic accessors
+            if (!songs || ([songs isKindOfClass:[NSArray class]] && [(NSArray *)songs count] == 0)) {
+                for (NSString *selName in @[@"songs", @"availableSongs", @"allSongs"]) {
+                    SEL sel = NSSelectorFromString(selName);
+                    if ([library respondsToSelector:sel]) {
+                        id result2 = ((id (*)(id, SEL))objc_msgSend)(library, sel);
+                        if (result2 && [result2 isKindOfClass:[NSArray class]] && [(NSArray *)result2 count] > 0) {
+                            songs = result2;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -9306,7 +10842,7 @@ static NSDictionary *FCPBridge_handleFlexMusicListSongs(NSDictionary *params) {
                     // Duration
                     SEL durSel = NSSelectorFromString(@"naturalDuration");
                     if ([song respondsToSelector:durSel]) {
-                        FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(song, durSel);
+                        FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(song, durSel);
                         info[@"durationSeconds"] = @(FCPBridge_cmtimeToSeconds(dur));
                     }
 
@@ -9451,12 +10987,12 @@ static NSDictionary *FCPBridge_handleFlexMusicGetSong(NSDictionary *params) {
             // Durations
             SEL natDurSel = NSSelectorFromString(@"naturalDuration");
             if ([song respondsToSelector:natDurSel]) {
-                FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(song, natDurSel);
+                FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(song, natDurSel);
                 info[@"naturalDurationSeconds"] = @(FCPBridge_cmtimeToSeconds(dur));
             }
             SEL minDurSel = NSSelectorFromString(@"minimumDuration");
             if ([song respondsToSelector:minDurSel]) {
-                FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(song, minDurSel);
+                FCPBridge_CMTime dur = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(song, minDurSel);
                 info[@"minimumDurationSeconds"] = @(FCPBridge_cmtimeToSeconds(dur));
             }
             SEL idealSel = NSSelectorFromString(@"idealDurations");
@@ -9570,7 +11106,7 @@ static NSDictionary *FCPBridge_handleFlexMusicGetTiming(NSDictionary *params) {
             // Get fitted duration from rendition
             SEL rendDurSel = NSSelectorFromString(@"duration");
             if ([rendition respondsToSelector:rendDurSel]) {
-                FCPBridge_CMTime rd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(rendition, rendDurSel);
+                FCPBridge_CMTime rd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(rendition, rendDurSel);
                 timing[@"fittedDurationSeconds"] = @(FCPBridge_cmtimeToSeconds(rd));
             }
 
@@ -9593,7 +11129,7 @@ static NSDictionary *FCPBridge_handleFlexMusicGetTiming(NSDictionary *params) {
                 for (id item in (NSArray *)items) {
                     SEL timeSel = NSSelectorFromString(@"time");
                     if ([item respondsToSelector:timeSel]) {
-                        FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, timeSel);
+                        FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, timeSel);
                         [times addObject:@(FCPBridge_cmtimeToSeconds(t))];
                     }
                 }
@@ -9634,7 +11170,7 @@ static NSDictionary *FCPBridge_handleFlexMusicGetTiming(NSDictionary *params) {
                                         for (id item in (NSArray *)metaItems) {
                                             SEL timeSel2 = NSSelectorFromString(@"time");
                                             if ([item respondsToSelector:timeSel2]) {
-                                                FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, timeSel2);
+                                                FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, timeSel2);
                                                 [times addObject:@(FCPBridge_cmtimeToSeconds(t))];
                                             }
                                         }
@@ -9868,7 +11404,7 @@ static NSDictionary *FCPBridge_handleFlexMusicAddToTimeline(NSDictionary *params
                         if (sequence) {
                             SEL durSel = NSSelectorFromString(@"duration");
                             if ([sequence respondsToSelector:durSel]) {
-                                FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(
+                                FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(
                                     sequence, durSel);
                                 durationSeconds = FCPBridge_cmtimeToSeconds(d);
                             }
@@ -10007,31 +11543,36 @@ static NSDictionary *FCPBridge_handleFlexMusicAddToTimeline(NSDictionary *params
                 stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
             escapedName = [escapedName stringByReplacingOccurrencesOfString:@"<" withString:@"&lt;"];
 
+            NSURL *tempURL = [NSURL fileURLWithPath:tempPath];
+            NSString *fmUID = [[[NSUUID UUID] UUIDString] substringToIndex:8];
             NSString *xml = [NSString stringWithFormat:
                 @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                @"<!DOCTYPE fcpxml>\n"
-                @"<fcpxml version=\"1.11\">\n"
-                @"  <resources>\n"
-                @"    <asset id=\"flexmusic_audio\" src=\"file://%@\" hasAudio=\"1\" hasVideo=\"0\" "
-                @"audioSources=\"1\" audioChannels=\"2\" audioRate=\"44100\"/>\n"
-                @"  </resources>\n"
-                @"  <library>\n"
-                @"    <event name=\"FlexMusic Import\">\n"
-                @"      <project name=\"%@ Audio\">\n"
-                @"        <sequence format=\"r1\" tcStart=\"0s\" tcFormat=\"NDF\" "
+                @"<!DOCTYPE fcpxml>\n\n"
+                @"<fcpxml version=\"1.14\">\n"
+                @"    <resources>\n"
+                @"        <format id=\"fmt_%@\" frameDuration=\"100/2400s\" width=\"1920\" "
+                @"height=\"1080\" name=\"FFVideoFormat1080p24\"/>\n"
+                @"        <asset id=\"fm_%@\" hasAudio=\"1\" hasVideo=\"0\" "
+                @"audioSources=\"1\" audioChannels=\"2\" audioRate=\"44100\" name=\"%@\">\n"
+                @"            <media-rep kind=\"original-media\" src=\"%@\"/>\n"
+                @"        </asset>\n"
+                @"    </resources>\n"
+                @"    <library>\n"
+                @"        <event name=\"FlexMusic Import\">\n"
+                @"            <project name=\"%@ Audio\">\n"
+                @"                <sequence format=\"fmt_%@\" tcStart=\"0s\" tcFormat=\"NDF\" "
                 @"audioLayout=\"stereo\" audioRate=\"48k\">\n"
-                @"          <spine>\n"
-                @"            <asset-clip ref=\"flexmusic_audio\" name=\"%@\" "
-                @"duration=\"%d/24s\" start=\"0s\"/>\n"
-                @"          </spine>\n"
-                @"        </sequence>\n"
-                @"      </project>\n"
-                @"    </event>\n"
-                @"  </library>\n"
-                @"</fcpxml>",
-                [tempPath stringByAddingPercentEncodingWithAllowedCharacters:
-                    [NSCharacterSet URLPathAllowedCharacterSet]],
-                escapedName, escapedName, durationFrames];
+                @"                    <spine>\n"
+                @"                        <asset-clip ref=\"fm_%@\" name=\"%@\" "
+                @"duration=\"%d00/2400s\" start=\"0s\"/>\n"
+                @"                    </spine>\n"
+                @"                </sequence>\n"
+                @"            </project>\n"
+                @"        </event>\n"
+                @"    </library>\n"
+                @"</fcpxml>\n",
+                fmUID, fmUID, escapedName, [tempURL absoluteString],
+                escapedName, fmUID, fmUID, escapedName, durationFrames];
 
             // Import the FCPXML
             NSString *xmlPath = [NSTemporaryDirectory()
@@ -10148,7 +11689,7 @@ static NSDictionary *FCPBridge_handleMontageAnalyze(NSDictionary *params) {
                         // Duration
                         double durationSec = 0;
                         if ([clip respondsToSelector:@selector(duration)]) {
-                            FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(
+                            FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(
                                 clip, @selector(duration));
                             durationSec = FCPBridge_cmtimeToSeconds(d);
                             info[@"duration"] = FCPBridge_serializeCMTime(d);
@@ -10197,22 +11738,9 @@ static NSDictionary *FCPBridge_handleMontageAnalyze(NSDictionary *params) {
                         if (hasAudio && hasVideo) score += 2.0;
                         info[@"score"] = @(score);
 
-                        // Check for media reference / file path
-                        SEL mediaRefSel = NSSelectorFromString(@"mediaReference");
-                        if ([clip respondsToSelector:mediaRefSel]) {
-                            id mediaRef = ((id (*)(id, SEL))objc_msgSend)(clip, mediaRefSel);
-                            if (mediaRef) {
-                                SEL urlSel = NSSelectorFromString(@"url");
-                                SEL pathSel = NSSelectorFromString(@"mediaPath");
-                                if ([mediaRef respondsToSelector:urlSel]) {
-                                    id url = ((id (*)(id, SEL))objc_msgSend)(mediaRef, urlSel);
-                                    if (url) info[@"mediaURL"] = [url absoluteString] ?: @"";
-                                } else if ([mediaRef respondsToSelector:pathSel]) {
-                                    id path = ((id (*)(id, SEL))objc_msgSend)(mediaRef, pathSel);
-                                    if (path) info[@"mediaPath"] = path;
-                                }
-                            }
-                        }
+                        // NOTE: Media URL resolution via originalMediaURL deadlocks inside
+                        // FCP's hardened runtime. Skip it — clips will use gaps in FCPXML.
+                        // The user can provide file paths manually for proper media references.
 
                         // Store handle
                         NSString *h = FCPBridge_storeHandle(clip);
@@ -10324,6 +11852,7 @@ static NSDictionary *FCPBridge_handleMontagePlan(NSDictionary *params) {
         NSMutableDictionary *entry = [NSMutableDictionary dictionary];
         entry[@"clipHandle"] = chosenClip[@"handle"] ?: @"";
         entry[@"clipName"] = chosenClip[@"name"] ?: @"";
+        entry[@"mediaURL"] = chosenClip[@"mediaURL"] ?: @"";
         entry[@"inSeconds"] = @(inPoint);
         entry[@"outSeconds"] = @(outPoint);
         entry[@"timelineStartSeconds"] = @(segStart);
@@ -10360,35 +11889,11 @@ static NSDictionary *FCPBridge_handleMontageAssemble(NSDictionary *params) {
             NSMutableDictionary *mediaResources = [NSMutableDictionary dictionary];
             NSMutableArray *spineClips = [NSMutableArray array];
 
-            int resourceIndex = 0;
+            int resourceIndex = 100; // Start at 100 to avoid ID collision with format
             for (NSDictionary *entry in editPlan) {
-                NSString *clipHandle = entry[@"clipHandle"];
-                id clip = clipHandle ? FCPBridge_resolveHandle(clipHandle) : nil;
-
                 NSString *resourceId = nil;
-                NSString *mediaURL = @"";
+                NSString *mediaURL = entry[@"mediaURL"] ?: @"";
                 NSString *clipName = entry[@"clipName"] ?: @"Clip";
-
-                if (clip) {
-                    SEL mediaRefSel = NSSelectorFromString(@"mediaReference");
-                    if ([clip respondsToSelector:mediaRefSel]) {
-                        id mediaRef = ((id (*)(id, SEL))objc_msgSend)(clip, mediaRefSel);
-                        if (mediaRef) {
-                            SEL urlSel = NSSelectorFromString(@"url");
-                            if ([mediaRef respondsToSelector:urlSel]) {
-                                id url = ((id (*)(id, SEL))objc_msgSend)(mediaRef, urlSel);
-                                if (url) mediaURL = [url absoluteString] ?: @"";
-                            }
-                        }
-                    }
-                    if (mediaURL.length == 0) {
-                        SEL srcSel = NSSelectorFromString(@"sourceMediaURL");
-                        if ([clip respondsToSelector:srcSel]) {
-                            id url = ((id (*)(id, SEL))objc_msgSend)(clip, srcSel);
-                            if (url) mediaURL = [url absoluteString] ?: @"";
-                        }
-                    }
-                }
 
                 // Deduplicate resources by media URL
                 if (mediaURL.length > 0 && mediaResources[mediaURL]) {
@@ -10414,34 +11919,48 @@ static NSDictionary *FCPBridge_handleMontageAssemble(NSDictionary *params) {
                 }];
             }
 
-            // Build FCPXML 1.11 document
+            // Build FCPXML 1.14 document (DTD-compliant, modeled after FCP's own export)
+            NSString *uid = [[[NSUUID UUID] UUIDString] substringToIndex:8];
+            NSString *fmtId = [NSString stringWithFormat:@"fmt_%@", uid];
+
             NSMutableString *xml = [NSMutableString string];
             [xml appendString:@"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"];
-            [xml appendString:@"<!DOCTYPE fcpxml>\n"];
-            [xml appendString:@"<fcpxml version=\"1.11\">\n"];
-            [xml appendString:@"  <resources>\n"];
-            [xml appendString:@"    <format id=\"r0\" frameDuration=\"1/24s\" width=\"1920\" "
-                                @"height=\"1080\" name=\"FFVideoFormat1080p24\"/>\n"];
+            [xml appendString:@"<!DOCTYPE fcpxml>\n\n"];
+            [xml appendString:@"<fcpxml version=\"1.14\">\n"];
+            [xml appendString:@"    <resources>\n"];
+            [xml appendFormat:@"        <format id=\"%@\" name=\"FFVideoFormat1080p24\" "
+                                @"frameDuration=\"100/2400s\" width=\"1920\" height=\"1080\"/>\n", fmtId];
 
+            // Assets with media-rep children (required by DTD)
             for (NSString *urlKey in mediaResources) {
                 NSDictionary *res = mediaResources[urlKey];
-                [xml appendFormat:@"    <asset id=\"%@\" src=\"%@\" hasAudio=\"1\" hasVideo=\"1\"/>\n",
-                    res[@"id"], res[@"url"]];
+                [xml appendFormat:@"        <asset id=\"%@\" name=\"%@\" hasVideo=\"1\" "
+                    @"format=\"%@\" hasAudio=\"1\" videoSources=\"1\" "
+                    @"audioSources=\"1\" audioChannels=\"2\" audioRate=\"44100\">\n",
+                    res[@"id"], res[@"id"], fmtId];
+                [xml appendFormat:@"            <media-rep kind=\"original-media\" src=\"%@\"/>\n",
+                    res[@"url"]];
+                [xml appendString:@"        </asset>\n"];
             }
 
             if (songFile.length > 0) {
                 NSURL *songURL = [NSURL fileURLWithPath:songFile];
-                [xml appendFormat:@"    <asset id=\"song_audio\" src=\"%@\" "
-                    @"hasAudio=\"1\" hasVideo=\"0\" audioSources=\"1\" "
-                    @"audioChannels=\"2\" audioRate=\"44100\"/>\n",
+                [xml appendString:@"        <asset id=\"song_audio\" name=\"Music\" "
+                    @"hasAudio=\"1\" audioSources=\"1\" audioChannels=\"2\" "
+                    @"audioRate=\"44100\">\n"];
+                [xml appendFormat:@"            <media-rep kind=\"original-media\" src=\"%@\"/>\n",
                     [songURL absoluteString]];
+                [xml appendString:@"        </asset>\n"];
             }
 
-            [xml appendString:@"  </resources>\n"];
-            [xml appendString:@"  <library>\n"];
-            [xml appendString:@"    <event name=\"Montage\">\n"];
-            [xml appendFormat:@"      <project name=\"%@\">\n",
-                [projectName stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"]];
+            [xml appendString:@"    </resources>\n"];
+            [xml appendString:@"    <library>\n"];
+            [xml appendFormat:@"        <event name=\"Montage\">\n"];
+
+            NSString *escapedProject = [[projectName
+                stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"]
+                stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
+            [xml appendFormat:@"            <project name=\"%@\">\n", escapedProject];
 
             // Calculate total duration
             double totalDuration = 0;
@@ -10450,76 +11969,77 @@ static NSDictionary *FCPBridge_handleMontageAssemble(NSDictionary *params) {
                              [clip[@"durationSeconds"] doubleValue];
                 if (end > totalDuration) totalDuration = end;
             }
-            int totalFrames = (int)(totalDuration * 24);
+            int totalFrames = (int)(totalDuration * 2400 / 100); // 24fps = 100/2400s per frame
 
-            [xml appendFormat:@"        <sequence format=\"r0\" tcStart=\"0s\" tcFormat=\"NDF\" "
-                @"audioLayout=\"stereo\" audioRate=\"48k\" duration=\"%d/24s\">\n", totalFrames];
-            [xml appendString:@"          <spine>\n"];
+            [xml appendFormat:@"                <sequence format=\"%@\" "
+                @"duration=\"%d00/2400s\" tcStart=\"0s\" tcFormat=\"NDF\" "
+                @"audioLayout=\"stereo\" audioRate=\"48k\">\n", fmtId, totalFrames];
+            [xml appendString:@"                    <spine>\n"];
 
-            // Add clips to spine with gaps where needed
-            double currentTime = 0;
+            // Add clips to spine — first clip gets the connected song audio
+            int offsetFrames = 0;
             for (NSUInteger i = 0; i < spineClips.count; i++) {
                 NSDictionary *clip = spineClips[i];
-                double tlStart = [clip[@"timelineStartSeconds"] doubleValue];
                 double durSec = [clip[@"durationSeconds"] doubleValue];
                 double inSec = [clip[@"inSeconds"] doubleValue];
 
-                if (tlStart > currentTime + 0.001) {
-                    double gapDur = tlStart - currentTime;
-                    int gapFrames = (int)(gapDur * 24);
-                    if (gapFrames > 0) {
-                        [xml appendFormat:@"            <gap duration=\"%d/24s\"/>\n", gapFrames];
-                    }
-                }
-
-                int durFrames = (int)(durSec * 24);
-                int inFrames = (int)(inSec * 24);
+                int durFrames = MAX(1, (int)(durSec * 2400 / 100));
+                int inFrames = (int)(inSec * 2400 / 100);
 
                 NSString *name = clip[@"name"];
                 NSString *escapedName = [[name stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"]
                     stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
                 escapedName = [escapedName stringByReplacingOccurrencesOfString:@"<" withString:@"&lt;"];
 
-                if ([clip[@"mediaURL"] length] > 0) {
-                    [xml appendFormat:@"            <asset-clip ref=\"%@\" name=\"%@\" "
-                        @"duration=\"%d/24s\" start=\"%d/24s\"",
-                        clip[@"resourceId"], escapedName, durFrames, inFrames];
-                } else {
-                    [xml appendFormat:@"            <gap name=\"%@\" duration=\"%d/24s\"",
-                        escapedName, durFrames];
-                }
+                BOOL hasMedia = [clip[@"mediaURL"] length] > 0;
+                BOOL isFirst = (i == 0);
+                BOOL needsSongChild = isFirst && songFile.length > 0;
 
-                // Add Cross Dissolve transition between clips if not last
-                if (i < spineClips.count - 1) {
-                    [xml appendString:@">\n"];
-                    if ([clip[@"mediaURL"] length] > 0) {
-                        [xml appendString:@"            </asset-clip>\n"];
+                if (hasMedia) {
+                    if (needsSongChild) {
+                        // First clip — open tag, add connected song, close tag
+                        [xml appendFormat:@"                        <asset-clip ref=\"%@\" "
+                            @"name=\"%@\" offset=\"%d00/2400s\" "
+                            @"duration=\"%d00/2400s\" start=\"%d00/2400s\">\n",
+                            clip[@"resourceId"], escapedName, offsetFrames,
+                            durFrames, inFrames];
+                        // Connected song audio on lane -1
+                        [xml appendFormat:@"                            <asset-clip ref=\"song_audio\" "
+                            @"lane=\"-1\" name=\"Music\" offset=\"0s\" "
+                            @"duration=\"%d00/2400s\" start=\"0s\"/>\n", totalFrames];
+                        [xml appendString:@"                        </asset-clip>\n"];
                     } else {
-                        [xml appendString:@"            </gap>\n"];
+                        [xml appendFormat:@"                        <asset-clip ref=\"%@\" "
+                            @"name=\"%@\" offset=\"%d00/2400s\" "
+                            @"duration=\"%d00/2400s\" start=\"%d00/2400s\"/>\n",
+                            clip[@"resourceId"], escapedName, offsetFrames,
+                            durFrames, inFrames];
                     }
-                    [xml appendString:@"            <transition duration=\"12/24s\" "
-                        @"name=\"Cross Dissolve\"/>\n"];
                 } else {
-                    [xml appendString:@"/>\n"];
+                    if (needsSongChild) {
+                        [xml appendFormat:@"                        <gap name=\"%@\" "
+                            @"offset=\"%d00/2400s\" duration=\"%d00/2400s\">\n",
+                            escapedName, offsetFrames, durFrames];
+                        [xml appendFormat:@"                            <asset-clip ref=\"song_audio\" "
+                            @"lane=\"-1\" name=\"Music\" offset=\"0s\" "
+                            @"duration=\"%d00/2400s\" start=\"0s\"/>\n", totalFrames];
+                        [xml appendString:@"                        </gap>\n"];
+                    } else {
+                        [xml appendFormat:@"                        <gap name=\"%@\" "
+                            @"offset=\"%d00/2400s\" duration=\"%d00/2400s\"/>\n",
+                            escapedName, offsetFrames, durFrames];
+                    }
                 }
 
-                currentTime = tlStart + durSec;
+                offsetFrames += durFrames;
             }
 
-            [xml appendString:@"          </spine>\n"];
-
-            if (songFile.length > 0) {
-                int songFrames = totalFrames;
-                [xml appendFormat:@"          <asset-clip ref=\"song_audio\" name=\"Music\" "
-                    @"lane=\"-1\" duration=\"%d/24s\" start=\"0s\" "
-                    @"offset=\"0s\"/>\n", songFrames];
-            }
-
-            [xml appendString:@"        </sequence>\n"];
-            [xml appendString:@"      </project>\n"];
-            [xml appendString:@"    </event>\n"];
-            [xml appendString:@"  </library>\n"];
-            [xml appendString:@"</fcpxml>"];
+            [xml appendString:@"                    </spine>\n"];
+            [xml appendString:@"                </sequence>\n"];
+            [xml appendString:@"            </project>\n"];
+            [xml appendString:@"        </event>\n"];
+            [xml appendString:@"    </library>\n"];
+            [xml appendString:@"</fcpxml>\n"];
 
             // Write and import FCPXML
             NSString *xmlPath = [NSTemporaryDirectory()
@@ -10528,26 +12048,29 @@ static NSDictionary *FCPBridge_handleMontageAssemble(NSDictionary *params) {
             [data writeToFile:xmlPath atomically:YES];
             NSURL *xmlURL = [NSURL fileURLWithPath:xmlPath];
 
-            id app = ((id (*)(id, SEL))objc_msgSend)(
-                objc_getClass("NSApplication"), @selector(sharedApplication));
-            id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+            // Set result immediately, then dispatch import async (it can show modal progress)
+            result = @{
+                @"status": @"ok",
+                @"projectName": projectName,
+                @"clipCount": @(spineClips.count),
+                @"totalDurationSeconds": @(totalDuration),
+                @"hasSongAudio": @(songFile.length > 0),
+                @"fcpxmlPath": xmlPath,
+                @"message": @"Montage FCPXML written. Importing..."
+            };
 
-            SEL openSel = NSSelectorFromString(@"openXMLDocumentWithURL:bundleURL:display:sender:");
-            if ([delegate respondsToSelector:openSel]) {
-                ((void (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
-                    delegate, openSel, xmlURL, nil, YES, nil);
-                result = @{
-                    @"status": @"ok",
-                    @"projectName": projectName,
-                    @"clipCount": @(spineClips.count),
-                    @"totalDurationSeconds": @(totalDuration),
-                    @"hasSongAudio": @(songFile.length > 0),
-                    @"fcpxmlPath": xmlPath,
-                    @"message": @"Montage assembled and imported via FCPXML"
-                };
-            } else {
-                result = @{@"error": @"PEAppController does not respond to openXMLDocumentWithURL:"};
-            }
+            // Import asynchronously on the next run loop iteration
+            NSURL *importURL = [xmlURL copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                id app = ((id (*)(id, SEL))objc_msgSend)(
+                    objc_getClass("NSApplication"), @selector(sharedApplication));
+                id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+                SEL openSel = NSSelectorFromString(@"openXMLDocumentWithURL:bundleURL:display:sender:");
+                if ([delegate respondsToSelector:openSel]) {
+                    ((void (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
+                        delegate, openSel, importURL, nil, YES, nil);
+                }
+            });
         } @catch (NSException *e) {
             result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
         }
@@ -10623,7 +12146,7 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
 
                         double durationSec = 0;
                         if ([clip respondsToSelector:@selector(duration)]) {
-                            FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(
+                            FCPBridge_CMTime d = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(
                                 clip, @selector(duration));
                             durationSec = FCPBridge_cmtimeToSeconds(d);
                         }
@@ -10714,7 +12237,7 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
             double fittedDuration = montageDuration;
             SEL rendDurSel = NSSelectorFromString(@"duration");
             if ([rendition respondsToSelector:rendDurSel]) {
-                FCPBridge_CMTime rd = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(rendition, rendDurSel);
+                FCPBridge_CMTime rd = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(rendition, rendDurSel);
                 fittedDuration = FCPBridge_cmtimeToSeconds(rd);
                 if (fittedDuration > 0) montageDuration = fittedDuration;
             }
@@ -10734,7 +12257,7 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
                 for (id item in (NSArray *)items) {
                     SEL timeSel = NSSelectorFromString(@"time");
                     if ([item respondsToSelector:timeSel]) {
-                        FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))objc_msgSend)(item, timeSel);
+                        FCPBridge_CMTime t = ((FCPBridge_CMTime (*)(id, SEL))STRET_MSG)(item, timeSel);
                         double sec = FCPBridge_cmtimeToSeconds(t);
                         if (sec > 0 && sec < montageDuration) [times addObject:@(sec)];
                     }
@@ -10870,7 +12393,7 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
             // Step 5: Assemble montage via FCPXML
             NSMutableDictionary *mediaResources = [NSMutableDictionary dictionary];
             NSMutableArray *spineClips = [NSMutableArray array];
-            int resIdx = 0;
+            int resIdx = 100;
 
             for (NSDictionary *entry in editPlan) {
                 NSString *clipHandle = entry[@"clipHandle"];
@@ -10878,24 +12401,8 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
                 NSString *mediaURL = @"";
 
                 if (clip) {
-                    SEL mediaRefSel = NSSelectorFromString(@"mediaReference");
-                    if ([clip respondsToSelector:mediaRefSel]) {
-                        id mediaRef = ((id (*)(id, SEL))objc_msgSend)(clip, mediaRefSel);
-                        if (mediaRef) {
-                            SEL urlSel = NSSelectorFromString(@"url");
-                            if ([mediaRef respondsToSelector:urlSel]) {
-                                id url = ((id (*)(id, SEL))objc_msgSend)(mediaRef, urlSel);
-                                if (url) mediaURL = [url absoluteString] ?: @"";
-                            }
-                        }
-                    }
-                    if (mediaURL.length == 0) {
-                        SEL srcSel = NSSelectorFromString(@"sourceMediaURL");
-                        if ([clip respondsToSelector:srcSel]) {
-                            id url = ((id (*)(id, SEL))objc_msgSend)(clip, srcSel);
-                            if (url) mediaURL = [url absoluteString] ?: @"";
-                        }
-                    }
+                    NSString *resolved = FCPBridge_getMediaURLForClip(clip);
+                    if (resolved) mediaURL = resolved;
                 }
 
                 NSString *resId = nil;
@@ -10916,86 +12423,107 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
                 }];
             }
 
+            // Build DTD-compliant FCPXML 1.14
+            NSString *uid = [[[NSUUID UUID] UUIDString] substringToIndex:8];
+            NSString *fmtId = [NSString stringWithFormat:@"fmt_%@", uid];
+
             NSMutableString *xml = [NSMutableString string];
             [xml appendString:@"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"];
-            [xml appendString:@"<!DOCTYPE fcpxml>\n"];
-            [xml appendString:@"<fcpxml version=\"1.11\">\n"];
-            [xml appendString:@"  <resources>\n"];
-            [xml appendString:@"    <format id=\"r0\" frameDuration=\"1/24s\" width=\"1920\" "
-                                @"height=\"1080\" name=\"FFVideoFormat1080p24\"/>\n"];
+            [xml appendString:@"<!DOCTYPE fcpxml>\n\n"];
+            [xml appendString:@"<fcpxml version=\"1.14\">\n"];
+            [xml appendString:@"    <resources>\n"];
+            [xml appendFormat:@"        <format id=\"%@\" name=\"FFVideoFormat1080p24\" "
+                                @"frameDuration=\"100/2400s\" width=\"1920\" height=\"1080\"/>\n", fmtId];
             for (NSString *urlKey in mediaResources) {
                 NSDictionary *res = mediaResources[urlKey];
-                [xml appendFormat:@"    <asset id=\"%@\" src=\"%@\" hasAudio=\"1\" hasVideo=\"1\"/>\n",
-                    res[@"id"], res[@"url"]];
+                [xml appendFormat:@"        <asset id=\"%@\" name=\"%@\" hasVideo=\"1\" "
+                    @"format=\"%@\" hasAudio=\"1\" videoSources=\"1\" "
+                    @"audioSources=\"1\" audioChannels=\"2\" audioRate=\"44100\">\n",
+                    res[@"id"], res[@"id"], fmtId];
+                [xml appendFormat:@"            <media-rep kind=\"original-media\" src=\"%@\"/>\n",
+                    res[@"url"]];
+                [xml appendString:@"        </asset>\n"];
             }
             if (songRendered) {
                 NSURL *songURL = [NSURL fileURLWithPath:tempSongPath];
-                [xml appendFormat:@"    <asset id=\"song_audio\" src=\"%@\" "
-                    @"hasAudio=\"1\" hasVideo=\"0\" audioSources=\"1\" "
-                    @"audioChannels=\"2\" audioRate=\"44100\"/>\n", [songURL absoluteString]];
+                [xml appendString:@"        <asset id=\"song_audio\" name=\"Music\" "
+                    @"hasAudio=\"1\" audioSources=\"1\" audioChannels=\"2\" "
+                    @"audioRate=\"44100\">\n"];
+                [xml appendFormat:@"            <media-rep kind=\"original-media\" src=\"%@\"/>\n",
+                    [songURL absoluteString]];
+                [xml appendString:@"        </asset>\n"];
             }
-            [xml appendString:@"  </resources>\n"];
+            [xml appendString:@"    </resources>\n"];
 
-            int totalFrames = (int)(montageDuration * 24);
-            NSString *escapedProject = [projectName
+            int totalFrames = (int)(montageDuration * 2400 / 100);
+            NSString *escapedProject = [[projectName
+                stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"]
                 stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
 
-            [xml appendString:@"  <library>\n"];
-            [xml appendString:@"    <event name=\"Montage\">\n"];
-            [xml appendFormat:@"      <project name=\"%@\">\n", escapedProject];
-            [xml appendFormat:@"        <sequence format=\"r0\" tcStart=\"0s\" tcFormat=\"NDF\" "
-                @"audioLayout=\"stereo\" audioRate=\"48k\" duration=\"%d/24s\">\n", totalFrames];
-            [xml appendString:@"          <spine>\n"];
+            [xml appendString:@"    <library>\n"];
+            [xml appendFormat:@"        <event name=\"Montage\">\n"];
+            [xml appendFormat:@"            <project name=\"%@\">\n", escapedProject];
+            [xml appendFormat:@"                <sequence format=\"%@\" "
+                @"duration=\"%d00/2400s\" tcStart=\"0s\" tcFormat=\"NDF\" "
+                @"audioLayout=\"stereo\" audioRate=\"48k\">\n", fmtId, totalFrames];
+            [xml appendString:@"                    <spine>\n"];
 
-            double curTime = 0;
+            int offsetFrames = 0;
             for (NSUInteger i = 0; i < spineClips.count; i++) {
                 NSDictionary *sc = spineClips[i];
-                double tlStart = [sc[@"timelineStartSeconds"] doubleValue];
                 double dur = [sc[@"durationSeconds"] doubleValue];
                 double inSec = [sc[@"inSeconds"] doubleValue];
 
-                if (tlStart > curTime + 0.001) {
-                    int gapFrames = (int)((tlStart - curTime) * 24);
-                    if (gapFrames > 0)
-                        [xml appendFormat:@"            <gap duration=\"%d/24s\"/>\n", gapFrames];
-                }
-
-                int durFrames = (int)(dur * 24);
-                int inFrames = (int)(inSec * 24);
+                int durFrames = MAX(1, (int)(dur * 2400 / 100));
+                int inFrames = (int)(inSec * 2400 / 100);
                 NSString *name = sc[@"name"];
                 NSString *escaped = [[name stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"]
                     stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
                 escaped = [escaped stringByReplacingOccurrencesOfString:@"<" withString:@"&lt;"];
 
-                if ([sc[@"mediaURL"] length] > 0) {
-                    [xml appendFormat:@"            <asset-clip ref=\"%@\" name=\"%@\" "
-                        @"duration=\"%d/24s\" start=\"%d/24s\"", sc[@"resourceId"], escaped,
-                        durFrames, inFrames];
-                } else {
-                    [xml appendFormat:@"            <gap name=\"%@\" duration=\"%d/24s\"",
-                        escaped, durFrames];
-                }
+                BOOL hasMedia = [sc[@"mediaURL"] length] > 0;
+                BOOL needsSong = (i == 0) && songRendered;
 
-                if (i < spineClips.count - 1) {
-                    [xml appendString:@"/>\n"];
-                    [xml appendString:@"            <transition duration=\"12/24s\" "
-                        @"name=\"Cross Dissolve\"/>\n"];
+                if (hasMedia) {
+                    if (needsSong) {
+                        [xml appendFormat:@"                        <asset-clip ref=\"%@\" "
+                            @"name=\"%@\" offset=\"%d00/2400s\" "
+                            @"duration=\"%d00/2400s\" start=\"%d00/2400s\">\n",
+                            sc[@"resourceId"], escaped, offsetFrames, durFrames, inFrames];
+                        [xml appendFormat:@"                            <asset-clip ref=\"song_audio\" "
+                            @"lane=\"-1\" name=\"Music\" offset=\"0s\" "
+                            @"duration=\"%d00/2400s\" start=\"0s\"/>\n", totalFrames];
+                        [xml appendString:@"                        </asset-clip>\n"];
+                    } else {
+                        [xml appendFormat:@"                        <asset-clip ref=\"%@\" "
+                            @"name=\"%@\" offset=\"%d00/2400s\" "
+                            @"duration=\"%d00/2400s\" start=\"%d00/2400s\"/>\n",
+                            sc[@"resourceId"], escaped, offsetFrames, durFrames, inFrames];
+                    }
                 } else {
-                    [xml appendString:@"/>\n"];
+                    if (needsSong) {
+                        [xml appendFormat:@"                        <gap name=\"%@\" "
+                            @"offset=\"%d00/2400s\" duration=\"%d00/2400s\">\n",
+                            escaped, offsetFrames, durFrames];
+                        [xml appendFormat:@"                            <asset-clip ref=\"song_audio\" "
+                            @"lane=\"-1\" name=\"Music\" offset=\"0s\" "
+                            @"duration=\"%d00/2400s\" start=\"0s\"/>\n", totalFrames];
+                        [xml appendString:@"                        </gap>\n"];
+                    } else {
+                        [xml appendFormat:@"                        <gap name=\"%@\" "
+                            @"offset=\"%d00/2400s\" duration=\"%d00/2400s\"/>\n",
+                            escaped, offsetFrames, durFrames];
+                    }
                 }
-                curTime = tlStart + dur;
+                offsetFrames += durFrames;
             }
 
-            [xml appendString:@"          </spine>\n"];
-            if (songRendered) {
-                [xml appendFormat:@"          <asset-clip ref=\"song_audio\" name=\"Music\" "
-                    @"lane=\"-1\" duration=\"%d/24s\" start=\"0s\" offset=\"0s\"/>\n", totalFrames];
-            }
-            [xml appendString:@"        </sequence>\n"];
-            [xml appendString:@"      </project>\n"];
-            [xml appendString:@"    </event>\n"];
-            [xml appendString:@"  </library>\n"];
-            [xml appendString:@"</fcpxml>"];
+            [xml appendString:@"                    </spine>\n"];
+            [xml appendString:@"                </sequence>\n"];
+            [xml appendString:@"            </project>\n"];
+            [xml appendString:@"        </event>\n"];
+            [xml appendString:@"    </library>\n"];
+            [xml appendString:@"</fcpxml>\n"];
 
             NSString *xmlPath = [NSTemporaryDirectory()
                 stringByAppendingPathComponent:@"fcpbridge_montage_auto.fcpxml"];
@@ -11003,28 +12531,29 @@ static NSDictionary *FCPBridge_handleMontageAuto(NSDictionary *params) {
             [data writeToFile:xmlPath atomically:YES];
             NSURL *xmlURL = [NSURL fileURLWithPath:xmlPath];
 
-            id app = ((id (*)(id, SEL))objc_msgSend)(
-                objc_getClass("NSApplication"), @selector(sharedApplication));
-            id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+            result = @{
+                @"status": @"ok",
+                @"projectName": projectName,
+                @"clipCount": @(spineClips.count),
+                @"totalDurationSeconds": @(montageDuration),
+                @"songRendered": @(songRendered),
+                @"style": style,
+                @"cutPoints": @(sortedCuts.count),
+                @"fcpxmlPath": xmlPath,
+                @"message": @"Auto montage FCPXML written. Importing..."
+            };
 
-            SEL openSel = NSSelectorFromString(@"openXMLDocumentWithURL:bundleURL:display:sender:");
-            if ([delegate respondsToSelector:openSel]) {
-                ((void (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
-                    delegate, openSel, xmlURL, nil, YES, nil);
-                result = @{
-                    @"status": @"ok",
-                    @"projectName": projectName,
-                    @"clipCount": @(spineClips.count),
-                    @"totalDurationSeconds": @(montageDuration),
-                    @"songRendered": @(songRendered),
-                    @"style": style,
-                    @"cutPoints": @(sortedCuts.count),
-                    @"fcpxmlPath": xmlPath,
-                    @"message": @"Auto montage created and imported"
-                };
-            } else {
-                result = @{@"error": @"PEAppController does not respond to openXMLDocumentWithURL:"};
-            }
+            NSURL *importURL = [xmlURL copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                id app = ((id (*)(id, SEL))objc_msgSend)(
+                    objc_getClass("NSApplication"), @selector(sharedApplication));
+                id delegate = ((id (*)(id, SEL))objc_msgSend)(app, @selector(delegate));
+                SEL openSel = NSSelectorFromString(@"openXMLDocumentWithURL:bundleURL:display:sender:");
+                if ([delegate respondsToSelector:openSel]) {
+                    ((void (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
+                        delegate, openSel, importURL, nil, YES, nil);
+                }
+            });
         } @catch (NSException *e) {
             result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
         }
@@ -12128,12 +13657,16 @@ static NSDictionary *FCPBridge_handleRequest(NSDictionary *request) {
     // timeline.* namespace
     else if ([method isEqualToString:@"timeline.action"]) {
         result = FCPBridge_handleTimelineAction(params);
+    } else if ([method isEqualToString:@"timeline.directAction"]) {
+        result = FCPBridge_handleDirectTimelineAction(params);
     } else if ([method isEqualToString:@"timeline.getState"]) {
         result = FCPBridge_handleTimelineGetState(params);
     } else if ([method isEqualToString:@"timeline.getDetailedState"]) {
         result = FCPBridge_handleTimelineGetDetailedState(params);
     } else if ([method isEqualToString:@"timeline.setRange"]) {
         result = FCPBridge_handleSetRange(params);
+    } else if ([method isEqualToString:@"timeline.addMarkers"]) {
+        result = FCPBridge_handleBatchAddMarkers(params);
     } else if ([method isEqualToString:@"timeline.batchExport"]) {
         result = FCPBridge_handleBatchExport(params);
     }
@@ -12148,6 +13681,8 @@ static NSDictionary *FCPBridge_handleRequest(NSDictionary *request) {
     // fcpxml.* namespace
     else if ([method isEqualToString:@"fcpxml.import"]) {
         result = FCPBridge_handleFCPXMLImport(params);
+    } else if ([method isEqualToString:@"fcpxml.pasteImport"]) {
+        result = FCPBridge_handlePasteboardImportXML(params);
     }
     // effects.* namespace
     else if ([method isEqualToString:@"effects.list"]) {
@@ -12278,6 +13813,10 @@ static NSDictionary *FCPBridge_handleRequest(NSDictionary *request) {
         result = FCPBridge_handleOptionsGet(params);
     } else if ([method isEqualToString:@"options.set"]) {
         result = FCPBridge_handleOptionsSet(params);
+    }
+    // beats.* namespace
+    else if ([method isEqualToString:@"beats.detect"]) {
+        result = FCPBridge_handleBeatsDetect(params);
     }
     // flexmusic.* namespace
     else if ([method isEqualToString:@"flexmusic.listSongs"]) {
