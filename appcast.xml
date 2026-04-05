@@ -6,6 +6,22 @@
     <description>SpliceKit Patcher release updates</description>
     <language>en</language>
     <item>
+      <title>SpliceKit v3.0.1</title>
+      <sparkle:version>3.0.1</sparkle:version>
+      <sparkle:shortVersionString>3.0.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 05 Apr 2026 04:08:38 +0000</pubDate>
+      <description><![CDATA[
+        <h2>What's New in 3.0.1</h2>
+        <p>Fix Sparkle false update, improved Parakeet error messages, bundle parakeet-transcriber in release</p>
+      ]]></description>
+      <enclosure
+        url="https://github.com/elliotttate/SpliceKit/releases/download/v3.0.1/SpliceKit-v3.0.1.dmg"
+        sparkle:edSignature="6pmrS+MX5ueJnltll3BW8jw96nBUYHrVAStD1Ft+92BFYT6amTyo4blUZbAyBingsMvB8QeMQGgJhs096Zu0DQ=="
+        length="11832290"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>SpliceKit v3.0.0</title>
       <sparkle:version>3.0.0</sparkle:version>
       <sparkle:shortVersionString>3.0.0</sparkle:shortVersionString>
