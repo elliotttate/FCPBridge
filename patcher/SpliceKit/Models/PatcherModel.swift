@@ -293,7 +293,7 @@ class PatcherModel: ObservableObject {
         let silenceSwift = repoDir + "/tools/silence-detector.swift"
         let silenceBin = buildDir + "/silence-detector"
         if FileManager.default.fileExists(atPath: silenceSwift) {
-            let swiftResult = shell("swiftc -O -suppress-warnings -o '\(silenceBin)' '\(silenceSwift)' 2>&1")
+            _ = shell("swiftc -O -suppress-warnings -o '\(silenceBin)' '\(silenceSwift)' 2>&1")
             if FileManager.default.fileExists(atPath: silenceBin) {
                 await logAsync("Built silence-detector tool")
             } else {
