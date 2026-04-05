@@ -42,4 +42,12 @@ if [ -f "$PARAKEET_DIR/Package.swift" ]; then
     fi
 fi
 
+# Sign all Mach-O binaries with hardened runtime (required for notarization)
+echo "Signing binaries with hardened runtime..."
+for bin in "$BUILD_OUT/SpliceKit" "$BUILD_OUT/silence-detector" "$BUILD_OUT/parakeet-transcriber"; do
+    if [ -f "$bin" ]; then
+        codesign --force --options runtime --timestamp --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$bin"
+    fi
+done
+
 echo "Build complete."
