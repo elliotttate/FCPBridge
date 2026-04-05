@@ -323,7 +323,7 @@ The command palette opens as a floating window inside FCP:
 - Arrow keys to navigate, Return to execute, Escape to close
 - Type natural language sentences and press Tab to ask Apple Intelligence
 - Falls back to keyword matching when Apple Intelligence is unavailable
-- Also accessible via toolbar button or SpliceKit menu
+- Also accessible via toolbar button or Enhancements menu
 
 ## Object Handles
 ```

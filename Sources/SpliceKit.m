@@ -223,8 +223,8 @@ static void SpliceKit_installMenu(void) {
         return;
     }
 
-    // Create "SpliceKit" top-level menu
-    NSMenu *bridgeMenu = [[NSMenu alloc] initWithTitle:@"SpliceKit"];
+    // Create "Enhancements" top-level menu
+    NSMenu *bridgeMenu = [[NSMenu alloc] initWithTitle:@"Enhancements"];
 
     NSMenuItem *transcriptItem = [[NSMenuItem alloc]
         initWithTitle:@"Transcript Editor"
@@ -278,7 +278,7 @@ static void SpliceKit_installMenu(void) {
     [bridgeMenu addItem:optionsMenuItem];
 
     // Add the menu to the menu bar (before the last item which is usually "Help")
-    NSMenuItem *bridgeMenuItem = [[NSMenuItem alloc] initWithTitle:@"SpliceKit" action:nil keyEquivalent:@""];
+    NSMenuItem *bridgeMenuItem = [[NSMenuItem alloc] initWithTitle:@"Enhancements" action:nil keyEquivalent:@""];
     bridgeMenuItem.submenu = bridgeMenu;
 
     NSInteger helpIndex = [mainMenu indexOfItemWithTitle:@"Help"];
@@ -288,7 +288,7 @@ static void SpliceKit_installMenu(void) {
         [mainMenu addItem:bridgeMenuItem];
     }
 
-    SpliceKit_log(@"SpliceKit menu installed (Ctrl+Option+T for Transcript Editor, Cmd+Shift+P for Command Palette)");
+    SpliceKit_log(@"Enhancements menu installed (Ctrl+Option+T for Transcript Editor, Cmd+Shift+P for Command Palette)");
 }
 
 static NSString * const kSpliceKitTranscriptToolbarID = @"SpliceKitTranscriptItemID";
@@ -491,7 +491,7 @@ static void SpliceKit_appDidLaunch(void) {
     free(allClasses);
     SpliceKit_log(@"Total ObjC classes in process: %u", classCount);
 
-    // Install SpliceKit menu in the menu bar
+    // Install Enhancements menu in the menu bar
     SpliceKit_installMenu();
 
     // Install toolbar button in FCP's main window

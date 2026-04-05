@@ -35,7 +35,7 @@
       <pubDate>Thu, 02 Apr 2026 19:00:28 +0000</pubDate>
       <description><![CDATA[
         <h2>What's New in 2.8.3</h2>
-        <p>Effect drag as adjustment clip: drag effects to empty timeline space to create named adjustment clips with effects applied, toggle via SpliceKit menu</p>
+        <p>Effect drag as adjustment clip: drag effects to empty timeline space to create named adjustment clips with effects applied, toggle via Enhancements menu</p>
       ]]></description>
       <enclosure
         url="https://github.com/elliotttate/FCPBridge/releases/download/v2.8.3/FCPBridgePatcher-v2.8.3.zip"
