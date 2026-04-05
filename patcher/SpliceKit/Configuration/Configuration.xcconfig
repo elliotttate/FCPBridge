@@ -5,12 +5,10 @@
 //
 
 //
-// Signing:
+// Development Team:
 //
 
-DEVELOPMENT_TEAM = RH4U5VJHM6
-CODE_SIGN_IDENTITY = Apple Development
-CODE_SIGN_STYLE = Automatic
+HARDCODED_DEVELOPMENT_TEAM=RH4U5VJHM6
 
 //
 // This allows you to have an optional Configuration Settings File (xcconfig) downstream that overrides the above settings:
