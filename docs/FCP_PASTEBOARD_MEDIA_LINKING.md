@@ -9,15 +9,19 @@
 
 ### What Works
 
-| Approach | Result | Undo Action |
-|----------|--------|-------------|
-| FCPXML on `com.apple.finalcutpro.xml` (generic UTI) | **Works** | "Append to Storyline" or "Add Media" |
-| FCPXML on generic + versioned UTIs (recommended) | **Works** | Same |
-| FCPXML version 1.14 with `v1-14` UTI | **Works** | Same |
-| FCPXML with `adjust-volume amount="-6dB"` | **Works** (paste succeeds) | Same |
-| FCPXML with `adjust-blend amount="0.5"` (opacity) | **Works** (paste succeeds) | Same |
-| FCPXML with `audioRole="effects"` | **Works** | Same |
-| File URL on pasteboard | **Paste enabled** | Needs inspector verification |
+| Approach | Result |
+|----------|--------|
+| FCPXML on `com.apple.finalcutpro.xml` (generic UTI) | **Works** — media imported, project created |
+| FCPXML on generic + versioned UTIs (recommended) | **Works** |
+| FCPXML version 1.14 with `v1-14` UTI | **Works** |
+| FCPXML audio clip with `adjust-volume` | **Works** — volume restored via bridge post-import |
+| FCPXML video clip with `adjust-volume` | **Works** — video + audio imported correctly |
+| FCPXML with `audioRole="effects"` | **Works** |
+| FCPXML with multiple clips (3 different assets) | **Works** — all clips imported |
+| FCPXML with `<marker>` and `<chapter-marker>` | **Works** — markers preserved at correct times (verified via nextMarker navigation) |
+| FCPXML with connected clips (`lane="1"`) | **Works** — primary + connected clip imported |
+| FCPXML with `<timeMap>` (retiming/speed) | **Works** — clip imported (speed verification pending) |
+| Volume restore via `inspector.set` after import | **Works** — `inspector.set("volume", -8)` confirmed |
 
 ### What Doesn't Work
 
@@ -25,6 +29,20 @@
 |----------|--------|
 | Version-specific UTI alone (e.g., `v1-11` without generic) | Paste NOT enabled |
 | FCPXML as `public.utf8-plain-text` | Paste NOT enabled |
+| `adjust-blend` (opacity) on audio-only clip | **Import fails** — "The dragged XML could not be imported" |
+| `adjust-blend` on video clip | **Import fails** — same error (even with valid video asset) |
+| File URL paste via bridge `paste:` | **Does not add clips** — bridge paste: ignores URLs |
+| `newEditsWithProject:mediaByReferenceOnly:` | **Crashes FCP** — causes TLKMarkerLayer exception |
+| Multi-clip per-clip volume (different volumes each) | **Partial** — all clips imported but bridge applies last volume to all selected |
+| `adjust-volume` preserved by import itself | **No** — always defaults to 0dB, must use post-import `inspector.set` |
+
+### Crashes Found
+
+- **Markers + layout**: Importing FCPXML with markers can crash FCP during timeline layout.
+  Crash in `TLKMarkerLayer layoutSublayers` → `CALayer setPosition:` with NaN/Inf position.
+  The markers are imported correctly (verified via `nextMarker`) but can crash on render.
+- **`newEditsWithProject:mediaByReferenceOnly:options:`**: Calling this on FFPasteboard with FCPXML
+  data crashes FCP. This method is not a viable path for timeline insertion.
 
 ### Native Clipboard Format (Corrections from Testing)
 
