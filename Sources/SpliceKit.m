@@ -10,6 +10,7 @@
 
 #import "SpliceKit.h"
 #import "SpliceKitCommandPalette.h"
+#import "SpliceKitDebugUI.h"
 #import <AppKit/AppKit.h>
 
 #pragma mark - Logging
@@ -554,6 +555,11 @@ static void SpliceKit_appDidLaunch(void) {
 
     // Install effect browser favorites context menu (always on)
     SpliceKit_installEffectFavoritesSwizzle();
+
+    // Rebuild FCP's hidden Debug pane + Debug menu bar (Apple strips the NIB
+    // and leaves the menu unassigned in release builds; we reconstruct both).
+    SpliceKit_installDebugSettingsPanel();
+    SpliceKit_installDebugMenuBar();
 
     // Start the control server on a background thread
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{

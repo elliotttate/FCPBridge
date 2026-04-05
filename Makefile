@@ -11,7 +11,8 @@ SOURCES = Sources/SpliceKit.m \
           Sources/SpliceKitSwizzle.m \
           Sources/SpliceKitServer.m \
           Sources/SpliceKitTranscriptPanel.m \
-          Sources/SpliceKitCommandPalette.m
+          Sources/SpliceKitCommandPalette.m \
+          Sources/SpliceKitDebugUI.m
 
 BUILD_DIR = build
 OUTPUT = $(BUILD_DIR)/SpliceKit

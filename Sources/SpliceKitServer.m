@@ -15,6 +15,7 @@
 #import "SpliceKit.h"
 #import "SpliceKitTranscriptPanel.h"
 #import "SpliceKitCommandPalette.h"
+#import "SpliceKitDebugUI.h"
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <sys/stat.h>
@@ -14613,6 +14614,49 @@ static NSDictionary *SpliceKit_handleDebugObserveNotification(NSDictionary *para
     return @{@"status": @"ok", @"observing": name};
 }
 
+#pragma mark - Debug: Hidden UI (Settings Panel + Menu Bar)
+
+// debug.showSettingsPanel — rebuilds FCP's missing Debug preferences pane
+// and injects it into the Settings window. Implementation lives in
+// SpliceKitDebugUI.m (ObjC-heavy view construction + LKPreferences ivar patching).
+static NSDictionary *SpliceKit_handleDebugShowSettingsPanel(NSDictionary *params) {
+    NSString *act = params[@"action"] ?: @"install";
+    if ([act isEqualToString:@"status"]) {
+        return @{@"installed": @(SpliceKit_isDebugSettingsPanelInstalled())};
+    }
+    if ([act isEqualToString:@"uninstall"] || [act isEqualToString:@"remove"]) {
+        BOOL ok = SpliceKit_uninstallDebugSettingsPanel();
+        return @{@"status": ok ? @"ok" : @"error",
+                 @"installed": @(SpliceKit_isDebugSettingsPanelInstalled())};
+    }
+    BOOL ok = SpliceKit_installDebugSettingsPanel();
+    if (!ok) {
+        return @{@"error": @"Failed to install Debug settings panel — see SpliceKit log"};
+    }
+    return @{@"status": @"ok",
+             @"installed": @(SpliceKit_isDebugSettingsPanelInstalled()),
+             @"note": @"Open Final Cut Pro → Settings to see the Debug tab."};
+}
+
+// debug.installMenuBar — adds the "Debug" top-level menu back to the menu bar.
+static NSDictionary *SpliceKit_handleDebugInstallMenuBar(NSDictionary *params) {
+    NSString *act = params[@"action"] ?: @"install";
+    if ([act isEqualToString:@"status"]) {
+        return @{@"installed": @(SpliceKit_isDebugMenuBarInstalled())};
+    }
+    if ([act isEqualToString:@"uninstall"] || [act isEqualToString:@"remove"]) {
+        BOOL ok = SpliceKit_uninstallDebugMenuBar();
+        return @{@"status": ok ? @"ok" : @"error",
+                 @"installed": @(SpliceKit_isDebugMenuBarInstalled())};
+    }
+    BOOL ok = SpliceKit_installDebugMenuBar();
+    if (!ok) {
+        return @{@"error": @"Failed to install Debug menu bar — see SpliceKit log"};
+    }
+    return @{@"status": @"ok",
+             @"installed": @(SpliceKit_isDebugMenuBarInstalled())};
+}
+
 #pragma mark - Debug: Breakpoints
 
 // True breakpoint system: swizzle a method, pause the calling thread,
@@ -15353,6 +15397,10 @@ static NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
         result = SpliceKit_handleDebugLoadPlugin(params);
     } else if ([method isEqualToString:@"debug.observeNotification"]) {
         result = SpliceKit_handleDebugObserveNotification(params);
+    } else if ([method isEqualToString:@"debug.showSettingsPanel"]) {
+        result = SpliceKit_handleDebugShowSettingsPanel(params);
+    } else if ([method isEqualToString:@"debug.installMenuBar"]) {
+        result = SpliceKit_handleDebugInstallMenuBar(params);
     } else if ([method isEqualToString:@"debug.breakpoint"]) {
         result = SpliceKit_handleDebugBreakpoint(params);
     }

@@ -1,0 +1,17 @@
+//
+// Configuration settings file format documentation can be found at:
+//
+// https://help.apple.com/xcode/#/dev745c5c974
+//
+
+//
+// Development Team:
+//
+
+HARDCODED_DEVELOPMENT_TEAM=RH4U5VJHM6
+
+//
+// This allows you to have an optional Configuration Settings File (xcconfig) downstream that overrides the above settings:
+//
+
+#include? "../../../../SpliceKit-Downstream.xcconfig"

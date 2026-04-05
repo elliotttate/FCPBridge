@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		226FB5362F823A28004BCB44 /* Configuration.xcconfig in Resources */ = {isa = PBXBuildFile; fileRef = 22D74E232F8235FE00A9252B /* Configuration.xcconfig */; };
 		22D74E1F2F81FBD900A9252B /* Credits.rtf in Resources */ = {isa = PBXBuildFile; fileRef = 22D74E1E2F81FBD900A9252B /* Credits.rtf */; };
 		BB0000000000000000000001 /* SpliceKitApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000001 /* SpliceKitApp.swift */; };
 		BB0000000000000000000002 /* PatcherModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000002 /* PatcherModel.swift */; };
@@ -34,54 +35,9 @@
 		};
 /* End PBXCopyFilesBuildPhase section */
 
-/* Begin PBXShellScriptBuildPhase section */
-		DD0000000000000000000005 /* Build Dylib & Tools */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-				"$(PROJECT_DIR)/../Sources/SpliceKit.m",
-				"$(PROJECT_DIR)/../Sources/SpliceKit.h",
-				"$(PROJECT_DIR)/../Sources/SpliceKitRuntime.m",
-				"$(PROJECT_DIR)/../Sources/SpliceKitSwizzle.m",
-				"$(PROJECT_DIR)/../Sources/SpliceKitServer.m",
-				"$(PROJECT_DIR)/../Sources/SpliceKitTranscriptPanel.m",
-				"$(PROJECT_DIR)/../Sources/SpliceKitTranscriptPanel.h",
-				"$(PROJECT_DIR)/../Sources/SpliceKitCommandPalette.m",
-				"$(PROJECT_DIR)/../Sources/SpliceKitCommandPalette.h",
-				"$(PROJECT_DIR)/../tools/silence-detector.swift",
-			);
-			name = "Build Dylib & Tools";
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/SpliceKit_prebuilt/SpliceKit",
-				"$(BUILT_PRODUCTS_DIR)/SpliceKit_prebuilt/silence-detector",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/bash;
-			shellScript = "bash \"${PROJECT_DIR}/scripts/build_dylib.sh\"\n";
-		};
-		DD0000000000000000000006 /* Bundle SpliceKit Resources */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/SpliceKit_prebuilt/SpliceKit",
-				"$(PROJECT_DIR)/../mcp/server.py",
-			);
-			name = "Bundle SpliceKit Resources";
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/SpliceKit",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/bash;
-			shellScript = "bash \"${PROJECT_DIR}/scripts/bundle_resources.sh\"\n";
-		};
-/* End PBXShellScriptBuildPhase section */
-
 /* Begin PBXFileReference section */
 		22D74E1E2F81FBD900A9252B /* Credits.rtf */ = {isa = PBXFileReference; lastKnownFileType = text.rtf; path = Credits.rtf; sourceTree = "<group>"; };
+		22D74E232F8235FE00A9252B /* Configuration.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Configuration.xcconfig; sourceTree = "<group>"; };
 		AA0000000000000000000001 /* SpliceKitApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpliceKitApp.swift; sourceTree = "<group>"; };
 		AA0000000000000000000002 /* PatcherModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PatcherModel.swift; sourceTree = "<group>"; };
 		AA0000000000000000000003 /* WizardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WizardView.swift; sourceTree = "<group>"; };
@@ -125,6 +81,14 @@
 			path = Code;
 			sourceTree = "<group>";
 		};
+		22D74E242F8235FE00A9252B /* Configuration */ = {
+			isa = PBXGroup;
+			children = (
+				22D74E232F8235FE00A9252B /* Configuration.xcconfig */,
+			);
+			path = Configuration;
+			sourceTree = "<group>";
+		};
 		CC0000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
@@ -137,6 +101,7 @@
 		CC0000000000000000000002 /* SpliceKit */ = {
 			isa = PBXGroup;
 			children = (
+				22D74E242F8235FE00A9252B /* Configuration */,
 				22D74E222F81FDCB00A9252B /* Code */,
 				CC0000000000000000000003 /* Models */,
 				CC0000000000000000000004 /* Views */,
@@ -231,10 +196,57 @@
 			files = (
 				BB0000000000000000000008 /* Assets.xcassets in Resources */,
 				22D74E1F2F81FBD900A9252B /* Credits.rtf in Resources */,
+				226FB5362F823A28004BCB44 /* Configuration.xcconfig in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		DD0000000000000000000005 /* Build Dylib & Tools */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/../Sources/SpliceKit.m",
+				"$(PROJECT_DIR)/../Sources/SpliceKit.h",
+				"$(PROJECT_DIR)/../Sources/SpliceKitRuntime.m",
+				"$(PROJECT_DIR)/../Sources/SpliceKitSwizzle.m",
+				"$(PROJECT_DIR)/../Sources/SpliceKitServer.m",
+				"$(PROJECT_DIR)/../Sources/SpliceKitTranscriptPanel.m",
+				"$(PROJECT_DIR)/../Sources/SpliceKitTranscriptPanel.h",
+				"$(PROJECT_DIR)/../Sources/SpliceKitCommandPalette.m",
+				"$(PROJECT_DIR)/../Sources/SpliceKitCommandPalette.h",
+				"$(PROJECT_DIR)/../tools/silence-detector.swift",
+			);
+			name = "Build Dylib & Tools";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/SpliceKit_prebuilt/SpliceKit",
+				"$(BUILT_PRODUCTS_DIR)/SpliceKit_prebuilt/silence-detector",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "bash \"${PROJECT_DIR}/scripts/build_dylib.sh\"\n";
+		};
+		DD0000000000000000000006 /* Bundle SpliceKit Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/SpliceKit_prebuilt/SpliceKit",
+				"$(PROJECT_DIR)/../mcp/server.py",
+			);
+			name = "Bundle SpliceKit Resources";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/SpliceKit",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "bash \"${PROJECT_DIR}/scripts/bundle_resources.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		DD0000000000000000000001 /* Sources */ = {
@@ -256,6 +268,7 @@
 /* Begin XCBuildConfiguration section */
 		220000000000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 22D74E232F8235FE00A9252B /* Configuration.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -283,7 +296,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = RH4U5VJHM6;
+				DEVELOPMENT_TEAM = "$(HARDCODED_DEVELOPMENT_TEAM)";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -313,6 +326,7 @@
 		};
 		220000000000000000000002 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 22D74E232F8235FE00A9252B /* Configuration.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -340,7 +354,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = RH4U5VJHM6;
+				DEVELOPMENT_TEAM = "$(HARDCODED_DEVELOPMENT_TEAM)";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -365,10 +379,12 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 3.0.1;
 				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "$(HARDCODED_DEVELOPMENT_TEAM)";
 				ENABLE_HARDENED_RUNTIME = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -394,10 +410,12 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 3.0.1;
 				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "$(HARDCODED_DEVELOPMENT_TEAM)";
 				ENABLE_HARDENED_RUNTIME = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
